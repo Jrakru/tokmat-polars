@@ -31,7 +31,7 @@ let extracted = plugin.extract_series(
 `tokmat-polars` can also be built and published as a Python package via
 `maturin`. The Rust crate exposes a `PyO3` extension module named
 `tokmat_polars`, and Polars can load the compiled plugin functions from that
-module path.
+module path. Python support starts at 3.12.
 
 Typical local workflow:
 
