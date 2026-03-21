@@ -1,14 +1,14 @@
 [package]
-name = "wanparser-polars"
+name = "tokmat-polars"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["wanParser Team"]
-description = "Standalone Polars integration crate for the wanParser stack"
+description = "Standalone Polars integration crate for tokmat"
 license = "MIT"
 readme = "README.md"
-documentation = "https://docs.rs/wanparser-polars"
-repository = "https://github.com/Jrakru/wanparser-polars"
+documentation = "https://docs.rs/tokmat-polars"
+repository = "https://github.com/Jrakru/tokmat-polars"
 keywords = ["polars", "parser", "python", "address", "tokmat"]
 categories = ["parser-implementations", "text-processing"]
 
@@ -23,7 +23,7 @@ all = "warn"
 pedantic = "warn"
 
 [lib]
-name = "wanparser_polars"
+name = "tokmat_polars"
 crate-type = ["cdylib"]
 
 [dependencies]
