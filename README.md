@@ -45,7 +45,7 @@ pytest -q
 
 ## Release workflow
 
-PyPI releases are published from GitHub Actions using Trusted Publishing. The
+`PyPI` releases are published from `GitHub Actions` using `Trusted Publishing`. The
 release workflow builds wheels and an sdist on tag pushes that match `v*`, then
 uploads them through `pypa/gh-action-pypi-publish`. The same tag also publishes
 the Rust crate to crates.io using a `CARGO_REGISTRY_TOKEN` GitHub secret.
@@ -58,7 +58,7 @@ git push origin v0.1.0
 ```
 
 Before the first release, configure this repository as a Trusted Publisher in
-the PyPI project settings and set the workflow environment to `pypi` if PyPI
+the `PyPI` project settings and set the workflow environment to `pypi` if `PyPI`
 prompts for it. For crates.io, create an API token and store it in GitHub as
 `CARGO_REGISTRY_TOKEN`.
 
