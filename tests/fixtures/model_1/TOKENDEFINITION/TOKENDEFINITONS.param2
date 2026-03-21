@@ -1,0 +1,21 @@
+<NAME>STRM</NAME>					<VALUE>^\d{1,2}\s*-\s*\d{1,3}\s*-\s*\d+\s*-\s*[W|E]\d$</VALUE>									Section-Township-Range-Meridian, for example: 25-24-1-W5
+<NAME>QSTRM</NAME>					<VALUE>^(NE|NW|SE|SW)\s*-\s*\d{1,2}\s*-\s*\d{1,3}\s*-\s*\d+\s*-\s*[W|E]\d$</VALUE>				Quarter Section-Section-Township-Range-Meridian, for example: SW-25-24-1-W5
+<NAME>LSTRM</NAME>					<VALUE>^\d+\s*-\s*\d{1,2}\s*-\s*\d{1,3}\s*-\s*\d+\s*-\s*[W|E]\d$</VALUE>						LSD-Section-Township-Range-Meridian, for example: 7-25-24-1-W5
+<NAME>POSTALCODE</NAME>       	<VALUE>^[A-Z]\d[A-Z][- _]?\d[A-Z]\d$</VALUE>
+<NAME>POBOX</NAME>					<VALUE>^BOX.*$</VALUE>
+<NAME>RR</NAME>						<VALUE>^RR.*$</VALUE>
+<NAME>APT</NAME>					<VALUE>^---APT.*---$</VALUE>
+<NAME>UNIT</NAME>					<VALUE>^---UNIT.*---$</VALUE>
+<NAME>SITE</NAME>					<VALUE>^---SITE.*---$</VALUE>
+<NAME>COMP</NAME>					<VALUE>^---COMP.*---$</VALUE>
+<NAME>MOD</NAME>					<VALUE>^---MOD.*---$</VALUE>
+<NAME>ROOM</NAME>					<VALUE>^---ROOM.*---$</VALUE>
+<NAME>STN</NAME>					<VALUE>^---STN.*---$</VALUE>
+<NAME>LCD</NAME>					<VALUE>^---LCD.*---$</VALUE>
+<NAME>RPO</NAME>					<VALUE>^---RPO.*---$</VALUE>
+<NAME>ALPHA</NAME>              	<VALUE>^[a-zA-Z]+$</VALUE>		
+<NAME>ALPHA_EXTENDED</NAME>        	<VALUE>^[a-zA-Z'-]+$</VALUE>																COMMENTS
+<NAME>NUM</NAME>                   	<VALUE>^\d+$</VALUE>
+<NAME>NUM_EXTENDED</NAME>			<VALUE>^[\d-]+$</VALUE>
+<NAME>ALPHA_NUM_EXTENDED</NAME>		<VALUE>(?=.*[0-9])(?=.*[a-zA-Z])[a-zA-Z0-9'-]+</VALUE>
+<NAME>ALPHA_NUM</NAME>              <VALUE>(?=.*[0-9])(?=.*[a-zA-Z])[a-zA-Z0-9]+</VALUE>                                            old version:^[a-zA-Z]+\d+[a-zA-Z0-9]*$|^\d+[a-zA-Z]+[a-zA-Z0-9]*$                              
