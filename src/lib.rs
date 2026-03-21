@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-//! Runtime crate for the wanParser Polars integration layer.
+//! Polars integration for tokmat, usable from both Rust and Python.
 
 use polars::prelude::*;
 use pyo3::prelude::*;
@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
-use tokmat::extractor::{Extractor, MatchMode};
+use tokmat::extractor::{Extractor, MatchMode, ParseOutput};
 use tokmat::tel::CompiledPattern;
 use tokmat::token_model::TokenModel;
 use tokmat::tokenizer::{TokenizedResult, tokenize_with_model};
@@ -20,6 +20,55 @@ static CONTEXT_CACHE: LazyLock<Mutex<HashMap<String, Arc<ModelContext>>>> =
 struct ModelContext {
     model: TokenModel,
     extractor: Extractor,
+}
+
+/// Rust-facing entry point for tokmat-backed Polars operations.
+#[derive(Clone)]
+pub struct TokmatPolars {
+    context: Arc<ModelContext>,
+}
+
+impl TokmatPolars {
+    /// Load or reuse a cached tokmat model from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model path cannot be loaded into a valid `tokmat` model.
+    pub fn from_model_path(model_path: impl AsRef<Path>) -> PolarsResult<Self> {
+        let model_path = model_path.as_ref().to_string_lossy().into_owned();
+        let context = get_or_load_context(&model_path)?;
+        Ok(Self { context })
+    }
+
+    /// Tokenize a UTF-8 series into a struct series containing raw value, tokens,
+    /// token types, and token classes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a UTF-8 series or if tokenization fails.
+    pub fn tokenize_series(&self, input: &Series) -> PolarsResult<Series> {
+        tokenize_series_with_context(input, &self.context)
+    }
+
+    /// Extract TEL captures from either a UTF-8 series or a tokenized struct series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input dtype is unsupported, the TEL pattern is invalid,
+    /// or extraction fails for the configured model.
+    pub fn extract_series(&self, input: &Series, pattern: &str) -> PolarsResult<Series> {
+        extract_series_with_context(input, &self.context, pattern)
+    }
+
+    /// Return the TEL capture field names the extractor will emit for a pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TEL pattern cannot be compiled.
+    pub fn capture_field_names(&self, pattern: &str) -> PolarsResult<Vec<String>> {
+        let _ = &self.context;
+        capture_field_names_from_pattern(pattern)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +126,16 @@ fn extract_output_type(input_fields: &[Field], kwargs: ExtractKwargs) -> PolarsR
 fn tokenize_expr_impl(inputs: &[Series], kwargs: &TokenizeKwargs) -> PolarsResult<Series> {
     let input = single_input(inputs, "tokenize_expr")?;
     let context = get_or_load_context(&kwargs.model_path)?;
+    tokenize_series_with_context(input, &context)
+}
+
+fn extract_expr_impl(inputs: &[Series], kwargs: &ExtractKwargs) -> PolarsResult<Series> {
+    let input = single_input(inputs, "extract_expr")?;
+    let context = get_or_load_context(&kwargs.model_path)?;
+    extract_series_with_context(input, &context, &kwargs.pattern)
+}
+
+fn tokenize_series_with_context(input: &Series, context: &ModelContext) -> PolarsResult<Series> {
     let rows = string_rows(input)?;
 
     let tokenized_rows = rows
@@ -91,18 +150,20 @@ fn tokenize_expr_impl(inputs: &[Series], kwargs: &TokenizeKwargs) -> PolarsResul
     build_tokenized_struct_series(input.name().clone(), &rows, &tokenized_rows)
 }
 
-fn extract_expr_impl(inputs: &[Series], kwargs: &ExtractKwargs) -> PolarsResult<Series> {
-    let input = single_input(inputs, "extract_expr")?;
-    let context = get_or_load_context(&kwargs.model_path)?;
-    let capture_names = capture_field_names_from_pattern(&kwargs.pattern)?;
+fn extract_series_with_context(
+    input: &Series,
+    context: &ModelContext,
+    pattern: &str,
+) -> PolarsResult<Series> {
+    let capture_names = capture_field_names_from_pattern(pattern)?;
 
     let parsed_rows = match input.dtype() {
-        DataType::String => extract_from_string_series(input, &context, kwargs)?,
-        DataType::Struct(_) => extract_from_tokenized_series(input, &context, kwargs)?,
+        DataType::String => extract_from_string_series(input, context, pattern)?,
+        DataType::Struct(_) => extract_from_tokenized_series(input, context, pattern)?,
         dtype => {
             polars_bail!(
                 InvalidOperation:
-                "extract_expr expected a String or tokenized Struct column, got {:?}",
+                "extract_series expected a String or tokenized Struct column, got {:?}",
                 dtype
             )
         }
@@ -212,30 +273,20 @@ fn string_rows(series: &Series) -> PolarsResult<Vec<Option<String>>> {
 fn extract_from_string_series(
     input: &Series,
     context: &ModelContext,
-    kwargs: &ExtractKwargs,
+    pattern: &str,
 ) -> PolarsResult<Vec<Option<HashMap<String, String>>>> {
     let rows = string_rows(input)?;
     rows.into_iter()
         .map(|raw_value| match raw_value {
             Some(raw_value) => {
                 let tokenized = tokenize_with_model(&raw_value, &context.model);
-                let parsed = context
-                    .extractor
-                    .parse_tokens(
-                        &raw_value,
-                        &tokenized.tokens,
-                        &tokenized.classes,
-                        &kwargs.pattern,
-                        MatchMode::Whole,
-                    )
-                    .map_err(|error| {
-                        polars_err!(
-                            ComputeError:
-                            "failed to extract TEL pattern '{}': {}",
-                            kwargs.pattern,
-                            error
-                        )
-                    })?;
+                let parsed = parse_from_tokenized_parts(
+                    context,
+                    &raw_value,
+                    &tokenized.tokens,
+                    &tokenized.classes,
+                    pattern,
+                )?;
                 Ok(Some(parse_output_to_row(parsed)))
             }
             None => Ok(None),
@@ -246,29 +297,19 @@ fn extract_from_string_series(
 fn extract_from_tokenized_series(
     input: &Series,
     context: &ModelContext,
-    kwargs: &ExtractKwargs,
+    pattern: &str,
 ) -> PolarsResult<Vec<Option<HashMap<String, String>>>> {
     let rows = tokenized_rows_from_struct(input)?;
     rows.into_iter()
         .map(|row| match row {
             Some(row) => {
-                let parsed = context
-                    .extractor
-                    .parse_tokens(
-                        &row.raw_value,
-                        &row.tokens,
-                        &row.classes,
-                        &kwargs.pattern,
-                        MatchMode::Whole,
-                    )
-                    .map_err(|error| {
-                        polars_err!(
-                            ComputeError:
-                            "failed to extract TEL pattern '{}': {}",
-                            kwargs.pattern,
-                            error
-                        )
-                    })?;
+                let parsed = parse_from_tokenized_parts(
+                    context,
+                    &row.raw_value,
+                    &row.tokens,
+                    &row.classes,
+                    pattern,
+                )?;
                 Ok(Some(parse_output_to_row(parsed)))
             }
             None => Ok(None),
@@ -276,7 +317,27 @@ fn extract_from_tokenized_series(
         .collect()
 }
 
-fn parse_output_to_row(output: tokmat::extractor::ParseOutput) -> HashMap<String, String> {
+fn parse_from_tokenized_parts(
+    context: &ModelContext,
+    raw_value: &str,
+    tokens: &[String],
+    classes: &[String],
+    pattern: &str,
+) -> PolarsResult<ParseOutput> {
+    context
+        .extractor
+        .parse_tokens(raw_value, tokens, classes, pattern, MatchMode::Whole)
+        .map_err(|error| {
+            polars_err!(
+                ComputeError:
+                "failed to extract TEL pattern '{}': {}",
+                pattern,
+                error
+            )
+        })
+}
+
+fn parse_output_to_row(output: ParseOutput) -> HashMap<String, String> {
     let mut row = output.fields;
     row.insert("complement".to_string(), output.complement);
     row
@@ -543,5 +604,43 @@ mod tests {
             .get(0);
 
         assert_eq!(complement, Some(""));
+    }
+
+    #[test]
+    fn rust_api_tokenizes_and_extracts() {
+        let plugin =
+            TokmatPolars::from_model_path(fixture_model_path()).expect("model should load");
+        let input = Series::new("address".into(), ["123 MAIN ST"]);
+
+        let tokenized = plugin
+            .tokenize_series(&input)
+            .expect("tokenize via rust api");
+        let extracted = plugin
+            .extract_series(&tokenized, "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>")
+            .expect("extract via rust api");
+
+        let struct_chunked = extracted
+            .struct_()
+            .expect("extract output should be struct");
+        let fields = struct_chunked.fields_as_series();
+        let civic = fields
+            .iter()
+            .find(|field| field.name().as_str() == "CIVIC")
+            .expect("CIVIC field should exist")
+            .str()
+            .expect("CIVIC field should be string")
+            .get(0);
+
+        assert_eq!(civic, Some("123"));
+        assert_eq!(
+            plugin
+                .capture_field_names("<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>")
+                .expect("capture names"),
+            vec![
+                "CIVIC".to_string(),
+                "STREET".to_string(),
+                "TYPE".to_string()
+            ]
+        );
     }
 }

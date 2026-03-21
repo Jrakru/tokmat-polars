@@ -24,7 +24,7 @@ pedantic = "warn"
 
 [lib]
 name = "tokmat_polars"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 polars = { version = "0.45.1", features = ["dtype-struct"] }

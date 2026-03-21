@@ -5,6 +5,27 @@ Standalone Polars integration crate for `tokmat`.
 This crate depends on the published `tokmat` package from crates.io and is
 intended to provide the dataframe-facing plugin layer around the core parser.
 
+## Rust usage
+
+`tokmat-polars` can also be used directly from Rust as a normal library crate.
+That path is useful when you want to build `Series` values in Rust and reuse the
+same tokenization and extraction logic without going through Python.
+
+```rust
+use polars::prelude::*;
+use tokmat_polars::TokmatPolars;
+
+let plugin = TokmatPolars::from_model_path("tests/fixtures/model_1")?;
+let input = Series::new("address".into(), ["123 MAIN ST"]);
+let tokenized = plugin.tokenize_series(&input)?;
+let extracted = plugin.extract_series(
+    &tokenized,
+    "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>",
+)?;
+# let _ = extracted;
+# Ok::<(), PolarsError>(())
+```
+
 ## Python packaging
 
 `tokmat-polars` can also be built and published as a Python package via
