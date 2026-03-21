@@ -1,0 +1,34 @@
+[package]
+name = "wanparser-polars"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["wanParser Team"]
+description = "Standalone Polars integration crate for the wanParser stack"
+license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/wanparser-polars"
+repository = "https://github.com/Jrakru/wanparser-polars"
+keywords = ["polars", "parser", "python", "address", "tokmat"]
+categories = ["parser-implementations", "text-processing"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[lib]
+name = "wanparser_polars"
+crate-type = ["cdylib"]
+
+[dependencies]
+polars = { version = "0.46", features = ["dtype-struct"] }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3-polars = { version = "0.19", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+tokmat = "0.1"
