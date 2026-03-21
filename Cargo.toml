@@ -3,7 +3,7 @@ name = "tokmat-polars"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-authors = ["wanParser Team"]
+authors = ["Jean Philippe Wan"]
 description = "Standalone Polars integration crate for tokmat"
 license = "MIT"
 readme = "README.md"
@@ -11,6 +11,9 @@ documentation = "https://docs.rs/tokmat-polars"
 repository = "https://github.com/Jrakru/tokmat-polars"
 keywords = ["polars", "parser", "python", "address", "tokmat"]
 categories = ["parser-implementations", "text-processing"]
+
+[package.metadata]
+copyright = "Copyright (c) 2026 Jean Philippe Wan"
 
 [package.metadata.docs.rs]
 all-features = true
