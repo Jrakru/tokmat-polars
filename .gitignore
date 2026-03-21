@@ -1,2 +1,8 @@
 /target
 Cargo.lock
+.venv/
+dist/
+*.whl
+
+__pycache__/
+*.pyc
