@@ -76,12 +76,33 @@ struct TokenizeKwargs {
     model_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum MatchModeKwarg {
+    #[default]
+    Whole,
+    Start,
+    End,
+    Any,
+}
+
+impl From<MatchModeKwarg> for MatchMode {
+    fn from(mode: MatchModeKwarg) -> Self {
+        match mode {
+            MatchModeKwarg::Whole => Self::Whole,
+            MatchModeKwarg::Start => Self::Start,
+            MatchModeKwarg::End => Self::End,
+            MatchModeKwarg::Any => Self::Any,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ExtractKwargs {
     model_path: String,
     pattern: String,
-    #[serde(default = "default_mode")]
-    mode: String,
+    #[serde(default)]
+    mode: MatchModeKwarg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +121,7 @@ fn tokenize_expr(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Seri
 #[allow(clippy::needless_pass_by_value)]
 #[polars_expr(output_type_func_with_kwargs=extract_output_type)]
 fn extract_expr(inputs: &[Series], kwargs: ExtractKwargs) -> PolarsResult<Series> {
-    extract_expr_impl(inputs, &kwargs)
+    extract_expr_impl(inputs, kwargs)
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -131,11 +152,10 @@ fn tokenize_expr_impl(inputs: &[Series], kwargs: &TokenizeKwargs) -> PolarsResul
     tokenize_series_with_context(input, &context)
 }
 
-fn extract_expr_impl(inputs: &[Series], kwargs: &ExtractKwargs) -> PolarsResult<Series> {
+fn extract_expr_impl(inputs: &[Series], kwargs: ExtractKwargs) -> PolarsResult<Series> {
     let input = single_input(inputs, "extract_expr")?;
     let context = get_or_load_context(&kwargs.model_path)?;
-    let mode = parse_match_mode(&kwargs.mode)?;
-    extract_series_with_context(input, &context, &kwargs.pattern, mode)
+    extract_series_with_context(input, &context, &kwargs.pattern, kwargs.mode.into())
 }
 
 fn tokenize_series_with_context(input: &Series, context: &ModelContext) -> PolarsResult<Series> {
@@ -266,23 +286,6 @@ fn capture_field_names_from_pattern(pattern: &str) -> PolarsResult<Vec<String>> 
     Ok(fields)
 }
 
-fn default_mode() -> String {
-    "whole".to_string()
-}
-
-fn parse_match_mode(mode: &str) -> PolarsResult<MatchMode> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "whole" => Ok(MatchMode::Whole),
-        "start" => Ok(MatchMode::Start),
-        "end" => Ok(MatchMode::End),
-        "any" => Ok(MatchMode::Any),
-        other => polars_bail!(
-            InvalidOperation:
-            "unsupported extract mode '{}'; expected one of: whole, start, end, any",
-            other
-        ),
-    }
-}
 
 fn string_rows(series: &Series) -> PolarsResult<Vec<Option<String>>> {
     Ok(series
@@ -565,10 +568,10 @@ mod tests {
         let input = Series::new("address".into(), ["123 MAIN ST"]);
         let output = extract_expr_impl(
             &[input],
-            &ExtractKwargs {
+            ExtractKwargs {
                 model_path: fixture_model_path(),
                 pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
-                mode: default_mode(),
+                mode: MatchModeKwarg::default(),
             },
         )
         .expect("extract should succeed");
@@ -614,10 +617,10 @@ mod tests {
 
         let output = extract_expr_impl(
             &[tokenized],
-            &ExtractKwargs {
+            ExtractKwargs {
                 model_path: fixture_model_path(),
                 pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
-                mode: default_mode(),
+                mode: MatchModeKwarg::default(),
             },
         )
         .expect("extract should succeed");
@@ -640,10 +643,10 @@ mod tests {
         let input = Series::new("address".into(), ["ATTN 123 MAIN ST"]);
         let output = extract_expr_impl(
             &[input],
-            &ExtractKwargs {
+            ExtractKwargs {
                 model_path: fixture_model_path(),
                 pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
-                mode: "any".to_string(),
+                mode: MatchModeKwarg::Any,
             },
         )
         .expect("extract should succeed");
