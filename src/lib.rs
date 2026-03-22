@@ -57,7 +57,22 @@ impl TokmatPolars {
     /// Returns an error if the input dtype is unsupported, the TEL pattern is invalid,
     /// or extraction fails for the configured model.
     pub fn extract_series(&self, input: &Series, pattern: &str) -> PolarsResult<Series> {
-        extract_series_with_context(input, &self.context, pattern, MatchMode::Whole)
+        self.extract_series_with_mode(input, pattern, MatchMode::Whole)
+    }
+
+    /// Extract TEL captures using the supplied match mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input dtype is unsupported, the TEL pattern is invalid,
+    /// or extraction fails for the configured model.
+    pub fn extract_series_with_mode(
+        &self,
+        input: &Series,
+        pattern: &str,
+        mode: MatchMode,
+    ) -> PolarsResult<Series> {
+        extract_series_with_context(input, &self.context, pattern, mode)
     }
 
     /// Return the TEL capture field names the extractor will emit for a pattern.
@@ -380,12 +395,7 @@ fn tokenized_rows_from_struct(series: &Series) -> PolarsResult<Vec<Option<Tokeni
         .map(|field| (field.name().to_string(), field))
         .collect::<HashMap<_, _>>();
 
-    let raw_field = field_map.get("raw_value").ok_or_else(|| {
-        polars_err!(
-            InvalidOperation:
-            "tokenized struct is missing required 'raw_value' field"
-        )
-    })?;
+    let raw_field = field_map.get("raw_value");
     let tokens_field = field_map.get("tokens").ok_or_else(|| {
         polars_err!(
             InvalidOperation:
@@ -399,19 +409,28 @@ fn tokenized_rows_from_struct(series: &Series) -> PolarsResult<Vec<Option<Tokeni
         )
     })?;
 
-    let raw_values = string_rows(raw_field)?;
+    let raw_values = raw_field
+        .map(string_rows)
+        .transpose()?
+        .unwrap_or_else(|| vec![None; series.len()]);
     let token_lists = tokens_field.list()?.into_iter().collect::<Vec<_>>();
     let class_lists = classes_field.list()?.into_iter().collect::<Vec<_>>();
 
     let mut rows = Vec::with_capacity(series.len());
     for index in 0..series.len() {
-        match (&raw_values[index], &token_lists[index], &class_lists[index]) {
-            (Some(raw_value), Some(tokens), Some(classes)) => rows.push(Some(TokenizedRow {
-                raw_value: raw_value.clone(),
-                tokens: list_series_to_strings(tokens)?,
-                classes: list_series_to_strings(classes)?,
-            })),
-            (None, None, None) => rows.push(None),
+        match (&token_lists[index], &class_lists[index]) {
+            (Some(tokens), Some(classes)) => {
+                let token_values = list_series_to_strings(tokens)?;
+                let raw_value = raw_values[index]
+                    .clone()
+                    .unwrap_or_else(|| token_values.join(""));
+                rows.push(Some(TokenizedRow {
+                    raw_value,
+                    tokens: token_values,
+                    classes: list_series_to_strings(classes)?,
+                }));
+            }
+            (None, None) if raw_values[index].is_none() => rows.push(None),
             _ => {
                 polars_bail!(
                     InvalidOperation:
@@ -638,6 +657,57 @@ mod tests {
     }
 
     #[test]
+    fn extract_helper_accepts_tokenized_struct_without_raw_value_or_types() {
+        let tokens = build_string_list_series(
+            "tokens",
+            [Some(vec![
+                "123".to_string(),
+                " ".to_string(),
+                "MAIN".to_string(),
+                " ".to_string(),
+                "ST".to_string(),
+            ])]
+            .into_iter(),
+        );
+        let classes = build_string_list_series(
+            "classes",
+            [Some(vec![
+                "NUM".to_string(),
+                " ".to_string(),
+                "ALPHA".to_string(),
+                " ".to_string(),
+                "STREETTYPE".to_string(),
+            ])]
+            .into_iter(),
+        );
+        let tokenized = StructChunked::from_series("address".into(), 1, [tokens, classes].iter())
+            .expect("struct should build")
+            .into_series();
+
+        let output = extract_expr_impl(
+            &[tokenized],
+            ExtractKwargs {
+                model_path: fixture_model_path(),
+                pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: MatchModeKwarg::default(),
+            },
+        )
+        .expect("extract should succeed");
+
+        let struct_chunked = output.struct_().expect("extract output should be struct");
+        let fields = struct_chunked.fields_as_series();
+        let civic = fields
+            .iter()
+            .find(|field| field.name().as_str() == "CIVIC")
+            .expect("CIVIC field should exist")
+            .str()
+            .expect("CIVIC field should be string")
+            .get(0);
+
+        assert_eq!(civic, Some("123"));
+    }
+
+    #[test]
     fn extract_helper_respects_any_mode_for_raw_string_input() {
         let input = Series::new("address".into(), ["ATTN 123 MAIN ST"]);
         let output = extract_expr_impl(
@@ -707,5 +777,34 @@ mod tests {
                 "TYPE".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn rust_api_extracts_with_explicit_match_mode() {
+        let plugin =
+            TokmatPolars::from_model_path(fixture_model_path()).expect("model should load");
+        let input = Series::new("address".into(), ["ATTN 123 MAIN ST"]);
+
+        let extracted = plugin
+            .extract_series_with_mode(
+                &input,
+                "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>",
+                MatchMode::Any,
+            )
+            .expect("extract via rust api");
+
+        let struct_chunked = extracted
+            .struct_()
+            .expect("extract output should be struct");
+        let fields = struct_chunked.fields_as_series();
+        let complement = fields
+            .iter()
+            .find(|field| field.name().as_str() == "complement")
+            .expect("complement field should exist")
+            .str()
+            .expect("complement field should be string")
+            .get(0);
+
+        assert_eq!(complement, Some("ATTN "));
     }
 }
