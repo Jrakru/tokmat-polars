@@ -80,3 +80,68 @@ expr = pl.plugins.register_plugin_function(
     use_abs_path=True,
 )
 ```
+
+## Plugin API
+
+`tokmat-polars` exposes two Polars plugin functions:
+
+- `tokenize_expr`
+- `extract_expr`
+
+### `tokenize_expr`
+
+Required kwargs:
+
+- `model_path`
+
+Returns a struct column with:
+
+- `raw_value`
+- `tokens`
+- `types`
+- `classes`
+
+### `extract_expr`
+
+Required kwargs:
+
+- `model_path`
+- `pattern`
+
+Optional kwargs:
+
+- `mode`
+
+Supported `mode` values:
+
+- `whole` (default)
+- `start`
+- `end`
+- `any`
+
+When `extract_expr` receives a tokenized struct column, it uses the embedded
+`raw_value` field when computing complements. This preserves `any`-mode
+behavior and keeps complement output aligned with the original text rather than
+with a placeholder reconstruction.
+
+Example:
+
+```python
+parsed = pl.DataFrame({"address": ["ATTN 123 MAIN ST"]}).select(
+    pl.plugins.register_plugin_function(
+        plugin_path=plugin_path,
+        function_name="extract_expr",
+        args=pl.col("address"),
+        kwargs={
+            "model_path": "/path/to/model",
+            "pattern": "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>",
+            "mode": "any",
+        },
+        use_abs_path=True,
+    ).alias("parsed")
+).unnest("parsed")
+```
+
+This returns capture fields plus a `complement` column. In the example above,
+the complement contains `"ATTN "` because the TEL pattern matches only the
+embedded address portion.

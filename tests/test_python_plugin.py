@@ -86,3 +86,24 @@ def test_extract_plugin_accepts_tokenized_struct_series() -> None:
         "TYPE": ["ST"],
         "complement": [""],
     }
+
+
+def test_extract_plugin_respects_any_mode_for_raw_strings() -> None:
+    frame = pl.DataFrame({"address": ["ATTN 123 MAIN ST"]})
+
+    extracted = frame.select(
+        plugin_expr(
+            "extract_expr",
+            pl.col("address"),
+            model_path=str(MODEL_PATH),
+            pattern=PATTERN,
+            mode="any",
+        ).alias("parsed")
+    ).unnest("parsed")
+
+    assert extracted.to_dict(as_series=False) == {
+        "CIVIC": ["123"],
+        "STREET": ["MAIN"],
+        "TYPE": ["ST"],
+        "complement": ["ATTN "],
+    }

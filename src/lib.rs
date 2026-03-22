@@ -57,7 +57,7 @@ impl TokmatPolars {
     /// Returns an error if the input dtype is unsupported, the TEL pattern is invalid,
     /// or extraction fails for the configured model.
     pub fn extract_series(&self, input: &Series, pattern: &str) -> PolarsResult<Series> {
-        extract_series_with_context(input, &self.context, pattern)
+        extract_series_with_context(input, &self.context, pattern, MatchMode::Whole)
     }
 
     /// Return the TEL capture field names the extractor will emit for a pattern.
@@ -80,6 +80,8 @@ struct TokenizeKwargs {
 struct ExtractKwargs {
     model_path: String,
     pattern: String,
+    #[serde(default = "default_mode")]
+    mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +134,8 @@ fn tokenize_expr_impl(inputs: &[Series], kwargs: &TokenizeKwargs) -> PolarsResul
 fn extract_expr_impl(inputs: &[Series], kwargs: &ExtractKwargs) -> PolarsResult<Series> {
     let input = single_input(inputs, "extract_expr")?;
     let context = get_or_load_context(&kwargs.model_path)?;
-    extract_series_with_context(input, &context, &kwargs.pattern)
+    let mode = parse_match_mode(&kwargs.mode)?;
+    extract_series_with_context(input, &context, &kwargs.pattern, mode)
 }
 
 fn tokenize_series_with_context(input: &Series, context: &ModelContext) -> PolarsResult<Series> {
@@ -154,12 +157,13 @@ fn extract_series_with_context(
     input: &Series,
     context: &ModelContext,
     pattern: &str,
+    mode: MatchMode,
 ) -> PolarsResult<Series> {
     let capture_names = capture_field_names_from_pattern(pattern)?;
 
     let parsed_rows = match input.dtype() {
-        DataType::String => extract_from_string_series(input, context, pattern)?,
-        DataType::Struct(_) => extract_from_tokenized_series(input, context, pattern)?,
+        DataType::String => extract_from_string_series(input, context, pattern, mode)?,
+        DataType::Struct(_) => extract_from_tokenized_series(input, context, pattern, mode)?,
         dtype => {
             polars_bail!(
                 InvalidOperation:
@@ -262,6 +266,24 @@ fn capture_field_names_from_pattern(pattern: &str) -> PolarsResult<Vec<String>> 
     Ok(fields)
 }
 
+fn default_mode() -> String {
+    "whole".to_string()
+}
+
+fn parse_match_mode(mode: &str) -> PolarsResult<MatchMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "whole" => Ok(MatchMode::Whole),
+        "start" => Ok(MatchMode::Start),
+        "end" => Ok(MatchMode::End),
+        "any" => Ok(MatchMode::Any),
+        other => polars_bail!(
+            InvalidOperation:
+            "unsupported extract mode '{}'; expected one of: whole, start, end, any",
+            other
+        ),
+    }
+}
+
 fn string_rows(series: &Series) -> PolarsResult<Vec<Option<String>>> {
     Ok(series
         .str()?
@@ -274,6 +296,7 @@ fn extract_from_string_series(
     input: &Series,
     context: &ModelContext,
     pattern: &str,
+    mode: MatchMode,
 ) -> PolarsResult<Vec<Option<HashMap<String, String>>>> {
     let rows = string_rows(input)?;
     rows.into_iter()
@@ -286,6 +309,7 @@ fn extract_from_string_series(
                     &tokenized.tokens,
                     &tokenized.classes,
                     pattern,
+                    mode,
                 )?;
                 Ok(Some(parse_output_to_row(parsed)))
             }
@@ -298,6 +322,7 @@ fn extract_from_tokenized_series(
     input: &Series,
     context: &ModelContext,
     pattern: &str,
+    mode: MatchMode,
 ) -> PolarsResult<Vec<Option<HashMap<String, String>>>> {
     let rows = tokenized_rows_from_struct(input)?;
     rows.into_iter()
@@ -309,6 +334,7 @@ fn extract_from_tokenized_series(
                     &row.tokens,
                     &row.classes,
                     pattern,
+                    mode,
                 )?;
                 Ok(Some(parse_output_to_row(parsed)))
             }
@@ -323,10 +349,11 @@ fn parse_from_tokenized_parts(
     tokens: &[String],
     classes: &[String],
     pattern: &str,
+    mode: MatchMode,
 ) -> PolarsResult<ParseOutput> {
     context
         .extractor
-        .parse_tokens(raw_value, tokens, classes, pattern, MatchMode::Whole)
+        .parse_tokens(raw_value, tokens, classes, pattern, mode)
         .map_err(|error| {
             polars_err!(
                 ComputeError:
@@ -541,6 +568,7 @@ mod tests {
             &ExtractKwargs {
                 model_path: fixture_model_path(),
                 pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: default_mode(),
             },
         )
         .expect("extract should succeed");
@@ -589,6 +617,7 @@ mod tests {
             &ExtractKwargs {
                 model_path: fixture_model_path(),
                 pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: default_mode(),
             },
         )
         .expect("extract should succeed");
@@ -604,6 +633,40 @@ mod tests {
             .get(0);
 
         assert_eq!(complement, Some(""));
+    }
+
+    #[test]
+    fn extract_helper_respects_any_mode_for_raw_string_input() {
+        let input = Series::new("address".into(), ["ATTN 123 MAIN ST"]);
+        let output = extract_expr_impl(
+            &[input],
+            &ExtractKwargs {
+                model_path: fixture_model_path(),
+                pattern: "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: "any".to_string(),
+            },
+        )
+        .expect("extract should succeed");
+
+        let struct_chunked = output.struct_().expect("extract output should be struct");
+        let fields = struct_chunked.fields_as_series();
+        let civic = fields
+            .iter()
+            .find(|field| field.name().as_str() == "CIVIC")
+            .expect("CIVIC field should exist")
+            .str()
+            .expect("CIVIC field should be string")
+            .get(0);
+        let complement = fields
+            .iter()
+            .find(|field| field.name().as_str() == "complement")
+            .expect("complement field should exist")
+            .str()
+            .expect("complement should be string")
+            .get(0);
+
+        assert_eq!(civic, Some("123"));
+        assert_eq!(complement, Some("ATTN "));
     }
 
     #[test]
