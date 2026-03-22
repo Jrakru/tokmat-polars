@@ -286,7 +286,6 @@ fn capture_field_names_from_pattern(pattern: &str) -> PolarsResult<Vec<String>> 
     Ok(fields)
 }
 
-
 fn string_rows(series: &Series) -> PolarsResult<Vec<Option<String>>> {
     Ok(series
         .str()?
