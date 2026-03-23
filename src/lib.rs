@@ -32,6 +32,7 @@ struct ModelContext {
     class_enum_values: Vec<String>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelFeatures {
     has_postalcode: bool,
@@ -100,7 +101,12 @@ impl CompactValueCodec {
         let ids_by_value = values_by_id
             .iter()
             .enumerate()
-            .map(|(index, value)| (value.clone(), index as u8))
+            .map(|(index, value)| {
+                (
+                    value.clone(),
+                    u8::try_from(index).expect("codec ids are bounded to u8 by construction"),
+                )
+            })
             .collect();
 
         Ok(Self {
@@ -125,6 +131,7 @@ impl CompactValueCodec {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 struct TokenizeLayout {
     include_raw_value: bool,
@@ -143,6 +150,7 @@ impl TokenizeLayout {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug)]
 struct TokenizedColumns {
     raw_values: Option<Vec<Option<String>>>,
@@ -249,6 +257,7 @@ impl TokmatPolars {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize)]
 struct TokenizeKwargs {
     model_path: String,
@@ -345,7 +354,7 @@ fn tokmat_polars(_py: Python<'_>, _module: &Bound<'_, PyModule>) -> PyResult<()>
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn tokenize_output_type(input_fields: &[Field], kwargs: TokenizeKwargs) -> PolarsResult<Field> {
     let output_name = output_field_name(input_fields, "tokenized");
     let context = get_or_load_context(&kwargs.model_path)?;
@@ -463,6 +472,7 @@ fn tokenize_series_with_context_staged(
     build_tokenized_struct_series(input.name().clone(), columns, context, layout)
 }
 
+#[allow(clippy::too_many_lines)]
 fn tokenize_series_with_context_direct(
     input: &Series,
     context: &ModelContext,
@@ -505,106 +515,101 @@ fn tokenize_series_with_context_direct(
     });
 
     for value in input.str()? {
-        match value {
-            Some(raw_value) => {
-                if let Some(values) = raw_values.as_mut() {
-                    values.push(Some(raw_value.to_string()));
-                }
+        if let Some(raw_value) = value {
+            if let Some(values) = raw_values.as_mut() {
+                values.push(Some(raw_value.to_string()));
+            }
 
-                let tokens = split_input_tokens(raw_value);
-                token_builder.append_values_iter(tokens.iter().map(String::as_str));
+            let tokens = split_input_tokens(raw_value);
+            token_builder.append_values_iter(tokens.iter().map(String::as_str));
 
-                let needs_row_types = layout.include_types || layout.include_type_ids;
-                let needs_row_classes = layout.include_classes || layout.include_class_ids;
+            let needs_row_types = layout.include_types || layout.include_type_ids;
+            let needs_row_classes = layout.include_classes || layout.include_class_ids;
 
-                let mut row_types = layout
-                    .include_types
-                    .then(SmallVec::<[Cow<'_, str>; 12]>::new);
-                let mut row_classes = layout
-                    .include_classes
-                    .then(SmallVec::<[Cow<'_, str>; 12]>::new);
-                let mut row_type_ids = layout.include_type_ids.then(SmallVec::<[u8; 12]>::new);
-                let mut row_class_ids = layout.include_class_ids.then(SmallVec::<[u8; 12]>::new);
+            let mut row_types = layout
+                .include_types
+                .then(SmallVec::<[Cow<'_, str>; 12]>::new);
+            let mut row_classes = layout
+                .include_classes
+                .then(SmallVec::<[Cow<'_, str>; 12]>::new);
+            let mut row_type_ids = layout.include_type_ids.then(SmallVec::<[u8; 12]>::new);
+            let mut row_class_ids = layout.include_class_ids.then(SmallVec::<[u8; 12]>::new);
 
-                if needs_row_types || needs_row_classes {
-                    for token in &tokens {
-                        let token_type =
-                            classify_token_ref(token, &context.model, context.features);
-                        if let Some(values) = row_types.as_mut() {
-                            values.push(token_type.clone());
-                        }
-                        if let Some(values) = row_type_ids.as_mut() {
-                            values
-                                .push(context.type_codec.encode_known_or_raw(token_type.as_ref()));
-                        }
-
-                        let class_value = if token.chars().all(char::is_whitespace) {
-                            Cow::Borrowed(token.as_str())
-                        } else if let Some(value) = context.model.token_class_lookup().get(token) {
-                            Cow::Borrowed(value.as_str())
-                        } else {
-                            Cow::Owned(token_type.as_ref().to_string())
-                        };
-
-                        if let Some(values) = row_classes.as_mut() {
-                            values.push(class_value.clone());
-                        }
-                        if let Some(values) = row_class_ids.as_mut() {
-                            values.push(
-                                context
-                                    .class_codec
-                                    .encode_known_or_raw(class_value.as_ref()),
-                            );
-                        }
+            if needs_row_types || needs_row_classes {
+                for token in &tokens {
+                    let token_type = classify_token_ref(token, &context.model, context.features);
+                    if let Some(values) = row_types.as_mut() {
+                        values.push(token_type.clone());
                     }
-                }
+                    if let Some(values) = row_type_ids.as_mut() {
+                        values.push(context.type_codec.encode_known_or_raw(token_type.as_ref()));
+                    }
 
-                if let Some(builder) = type_builder.as_mut() {
-                    if let Some(values) = row_types {
-                        builder.append_values_iter(values.iter().map(|c| c.as_ref()));
+                    let class_value = if token.chars().all(char::is_whitespace) {
+                        Cow::Borrowed(token.as_str())
+                    } else if let Some(value) = context.model.token_class_lookup().get(token) {
+                        Cow::Borrowed(value.as_str())
                     } else {
-                        builder.append_values_iter(std::iter::empty::<&str>());
+                        Cow::Owned(token_type.as_ref().to_string())
+                    };
+
+                    if let Some(values) = row_classes.as_mut() {
+                        values.push(class_value.clone());
                     }
-                }
-                if let Some(builder) = class_builder.as_mut() {
-                    if let Some(values) = row_classes {
-                        builder.append_values_iter(values.iter().map(|c| c.as_ref()));
-                    } else {
-                        builder.append_values_iter(std::iter::empty::<&str>());
-                    }
-                }
-                if let Some(builder) = type_id_builder.as_mut() {
-                    if let Some(values) = row_type_ids {
-                        builder.append_slice(values.as_slice());
-                    } else {
-                        builder.append_slice(&[]);
-                    }
-                }
-                if let Some(builder) = class_id_builder.as_mut() {
-                    if let Some(values) = row_class_ids {
-                        builder.append_slice(values.as_slice());
-                    } else {
-                        builder.append_slice(&[]);
+                    if let Some(values) = row_class_ids.as_mut() {
+                        values.push(
+                            context
+                                .class_codec
+                                .encode_known_or_raw(class_value.as_ref()),
+                        );
                     }
                 }
             }
-            None => {
-                if let Some(values) = raw_values.as_mut() {
-                    values.push(None);
+
+            if let Some(builder) = type_builder.as_mut() {
+                if let Some(values) = row_types {
+                    builder.append_values_iter(values.iter().map(AsRef::as_ref));
+                } else {
+                    builder.append_values_iter(std::iter::empty::<&str>());
                 }
-                token_builder.append_null();
-                if let Some(builder) = type_builder.as_mut() {
-                    builder.append_null();
+            }
+            if let Some(builder) = class_builder.as_mut() {
+                if let Some(values) = row_classes {
+                    builder.append_values_iter(values.iter().map(AsRef::as_ref));
+                } else {
+                    builder.append_values_iter(std::iter::empty::<&str>());
                 }
-                if let Some(builder) = class_builder.as_mut() {
-                    builder.append_null();
+            }
+            if let Some(builder) = type_id_builder.as_mut() {
+                if let Some(values) = row_type_ids {
+                    builder.append_slice(values.as_slice());
+                } else {
+                    builder.append_slice(&[]);
                 }
-                if let Some(builder) = type_id_builder.as_mut() {
-                    builder.append_null();
+            }
+            if let Some(builder) = class_id_builder.as_mut() {
+                if let Some(values) = row_class_ids {
+                    builder.append_slice(values.as_slice());
+                } else {
+                    builder.append_slice(&[]);
                 }
-                if let Some(builder) = class_id_builder.as_mut() {
-                    builder.append_null();
-                }
+            }
+        } else {
+            if let Some(values) = raw_values.as_mut() {
+                values.push(None);
+            }
+            token_builder.append_null();
+            if let Some(builder) = type_builder.as_mut() {
+                builder.append_null();
+            }
+            if let Some(builder) = class_builder.as_mut() {
+                builder.append_null();
+            }
+            if let Some(builder) = type_id_builder.as_mut() {
+                builder.append_null();
+            }
+            if let Some(builder) = class_id_builder.as_mut() {
+                builder.append_null();
             }
         }
     }
@@ -754,7 +759,9 @@ fn list_output_dtype(
 ) -> PolarsResult<DataType> {
     match output {
         StringListOutput::String => Ok(DataType::String),
-        StringListOutput::Categorical => Ok(DataType::Categorical(None, Default::default())),
+        StringListOutput::Categorical => {
+            Ok(DataType::Categorical(None, CategoricalOrdering::default()))
+        }
         StringListOutput::Enum => enum_values
             .map(enum_dtype)
             .ok_or_else(|| polars_err!(InvalidOperation: "enum output requires fixed categories")),
@@ -904,6 +911,7 @@ fn extract_from_string_series(
     build_extract_struct_series(input.name().clone(), field_columns, &complements)
 }
 
+#[allow(clippy::too_many_lines)]
 fn extract_from_tokenized_series(
     input: &Series,
     context: &ModelContext,
@@ -949,14 +957,14 @@ fn extract_from_tokenized_series(
     }
 
     let mut raw_iter = raw_field
-        .map(|field| field.str().map(|values| values.into_iter()))
+        .map(|field| field.str().map(IntoIterator::into_iter))
         .transpose()?;
     let mut token_iter = tokens_field.list()?.into_iter();
     let mut class_iter = classes_field
-        .map(|field| field.list().map(|values| values.into_iter()))
+        .map(|field| field.list().map(IntoIterator::into_iter))
         .transpose()?;
     let mut class_id_iter = class_ids_field
-        .map(|field| field.list().map(|values| values.into_iter()))
+        .map(|field| field.list().map(IntoIterator::into_iter))
         .transpose()?;
     let mut field_columns = init_extract_columns(capture_names, input.len());
     let mut complements = Vec::with_capacity(input.len());
@@ -972,8 +980,7 @@ fn extract_from_tokenized_series(
                 let token_values = list_series_to_str_views(&tokens)?;
                 let class_values = list_series_to_str_views(&classes)?;
                 let raw_value_buf = raw_value
-                    .map(Cow::Borrowed)
-                    .unwrap_or_else(|| Cow::Owned(join_str_views(&token_values)));
+                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
                 let parsed = parse_from_tokenized_parts(
                     context,
                     raw_value_buf,
@@ -1002,8 +1009,7 @@ fn extract_from_tokenized_series(
                     .filter(|should_join| *should_join)
                     .map(|_| Instant::now());
                 let raw_value_buf = raw_value
-                    .map(Cow::Borrowed)
-                    .unwrap_or_else(|| Cow::Owned(join_str_views(&token_values)));
+                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
                 let raw_join_elapsed = elapsed_since(raw_join_start);
                 let parse_start = profile_enabled().then(Instant::now);
                 let parsed = parse_from_tokenized_parts(
@@ -1024,14 +1030,7 @@ fn extract_from_tokenized_series(
                 }
                 push_parse_output(&mut field_columns, &mut complements, Some(parsed));
             }
-            (Some(None), Some(None), Some(None))
-            | (Some(None), Some(None), None)
-            | (Some(None), None, Some(None))
-                if raw_value.is_none() =>
-            {
-                push_parse_output(&mut field_columns, &mut complements, None);
-            }
-            (Some(None), None, None) if raw_value.is_none() => {
+            (Some(None), Some(None) | None, Some(None) | None) if raw_value.is_none() => {
                 push_parse_output(&mut field_columns, &mut complements, None);
             }
             _ => {
@@ -1096,10 +1095,10 @@ fn extract_from_tokenized_series_parallel(
         .into_par_iter()
         .map(|(start, end)| {
             process_extract_chunk(
-                &raw_series,
+                raw_series.as_ref(),
                 &tokens_series,
-                &classes_series,
-                &class_ids_series,
+                classes_series.as_ref(),
+                class_ids_series.as_ref(),
                 context,
                 pattern,
                 mode,
@@ -1160,11 +1159,12 @@ fn extract_from_tokenized_series_parallel(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn process_extract_chunk(
-    raw_series: &Option<Series>,
+    raw_series: Option<&Series>,
     tokens_series: &Series,
-    classes_series: &Option<Series>,
-    class_ids_series: &Option<Series>,
+    classes_series: Option<&Series>,
+    class_ids_series: Option<&Series>,
     context: &ModelContext,
     pattern: &str,
     mode: MatchMode,
@@ -1172,16 +1172,10 @@ fn process_extract_chunk(
     start: usize,
     end: usize,
 ) -> PolarsResult<ChunkExtractOutput> {
-    let raw_utf8 = raw_series.as_ref().map(|series| series.str()).transpose()?;
+    let raw_utf8 = raw_series.map(Series::str).transpose()?;
     let token_lists = tokens_series.list()?;
-    let class_lists = classes_series
-        .as_ref()
-        .map(|series| series.list())
-        .transpose()?;
-    let class_id_lists = class_ids_series
-        .as_ref()
-        .map(|series| series.list())
-        .transpose()?;
+    let class_lists = classes_series.map(Series::list).transpose()?;
+    let class_id_lists = class_ids_series.map(Series::list).transpose()?;
 
     let mut field_values = capture_names
         .iter()
@@ -1206,8 +1200,7 @@ fn process_extract_chunk(
                 let token_values = list_series_to_str_views(&tokens)?;
                 let class_values = list_series_to_str_views(&classes)?;
                 let raw_value_buf = raw_value
-                    .map(Cow::Borrowed)
-                    .unwrap_or_else(|| Cow::Owned(join_str_views(&token_values)));
+                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
                 let parsed = parse_from_tokenized_parts(
                     context,
                     raw_value_buf,
@@ -1244,8 +1237,7 @@ fn process_extract_chunk(
                     .filter(|should_join| *should_join)
                     .map(|_| Instant::now());
                 let raw_value_buf = raw_value
-                    .map(Cow::Borrowed)
-                    .unwrap_or_else(|| Cow::Owned(join_str_views(&token_values)));
+                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
                 let raw_join_elapsed = elapsed_since(raw_join_start);
 
                 let parse_start = profile_enabled().then(Instant::now);
@@ -1318,14 +1310,12 @@ fn parse_from_tokenized_parts<T: AsRef<str>, C: AsRef<str>>(
         })
 }
 
-fn list_series_to_str_views<'a>(series: &'a Series) -> PolarsResult<Vec<&'a str>> {
+fn list_series_to_str_views(series: &Series) -> PolarsResult<Vec<&str>> {
     series
         .str()?
         .into_iter()
         .map(|value| {
-            value
-                .map(|value| value)
-                .ok_or_else(|| polars_err!(InvalidOperation: "list values may not contain nulls"))
+            value.ok_or_else(|| polars_err!(InvalidOperation: "list values may not contain nulls"))
         })
         .collect()
 }
@@ -1536,6 +1526,7 @@ fn build_string_list_series(name: &str, rows: Vec<Option<Vec<String>>>) -> Serie
     builder.finish().into_series()
 }
 
+#[allow(unsafe_code)]
 fn build_enum_list_series(
     name: &str,
     rows: Vec<Option<Vec<String>>>,
@@ -1555,7 +1546,7 @@ fn build_enum_list_series(
     // `base` already contains valid list chunks; we are only restoring the logical
     // list child dtype metadata so the outer struct field matches the produced value.
     Ok(unsafe {
-        Series::from_chunks_and_dtype_unchecked(name.into(), base.chunks().to_vec(), &list_dtype)
+        Series::from_chunks_and_dtype_unchecked(name.into(), base.chunks().clone(), &list_dtype)
     })
 }
 
@@ -1661,9 +1652,9 @@ fn classify_token_ref<'a>(
             regex
                 .is_match(token.as_bytes())
                 .ok()
-                .and_then(|matched| matched.then(|| Cow::Borrowed(name.as_str())))
+                .and_then(|matched| matched.then_some(Cow::Borrowed(name.as_str())))
         })
-        .unwrap_or_else(|| Cow::Borrowed(token))
+        .unwrap_or(Cow::Borrowed(token))
 }
 
 fn tokenize_row(raw_value: &str, context: &ModelContext, layout: TokenizeLayout) -> TokenizedRow {
@@ -1772,8 +1763,8 @@ mod tests {
             .expect("first row should be non-null");
         let token_values =
             list_series_to_str_views(&first_tokens).expect("list conversion should work");
-        assert!(token_values.iter().any(|value| *value == "123"));
-        assert!(token_values.iter().any(|value| *value == "MAIN"));
+        assert!(token_values.contains(&"123"));
+        assert!(token_values.contains(&"MAIN"));
     }
 
     #[test]
@@ -1827,15 +1818,24 @@ mod tests {
         let fields = struct_chunked.fields_as_series();
         assert_eq!(
             fields[0].dtype(),
-            &DataType::List(Box::new(DataType::Categorical(None, Default::default())))
+            &DataType::List(Box::new(DataType::Categorical(
+                None,
+                CategoricalOrdering::default(),
+            )))
         );
         assert_eq!(
             fields[1].dtype(),
-            &DataType::List(Box::new(DataType::Categorical(None, Default::default())))
+            &DataType::List(Box::new(DataType::Categorical(
+                None,
+                CategoricalOrdering::default(),
+            )))
         );
         assert_eq!(
             fields[2].dtype(),
-            &DataType::List(Box::new(DataType::Categorical(None, Default::default())))
+            &DataType::List(Box::new(DataType::Categorical(
+                None,
+                CategoricalOrdering::default(),
+            )))
         );
     }
 

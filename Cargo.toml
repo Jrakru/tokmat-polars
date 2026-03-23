@@ -36,4 +36,4 @@ pyo3-polars = { version = "0.19", features = ["derive"] }
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 smallvec = "1.13"
-tokmat = { version = "0.1.1", path = "../tokmat" }
+tokmat = "0.2.0"
