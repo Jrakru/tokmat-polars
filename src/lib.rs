@@ -208,7 +208,7 @@ fn extract_series_with_context(
         }
     };
 
-    build_extract_struct_series(input.name().clone(), &capture_names, &parsed_rows)
+    build_extract_struct_series(input.name().clone(), &capture_names, parsed_rows)
 }
 
 fn get_or_load_context(model_path: &str) -> PolarsResult<Arc<ModelContext>> {
@@ -314,7 +314,7 @@ fn extract_from_string_series(
     context: &ModelContext,
     pattern: &str,
     mode: MatchMode,
-) -> PolarsResult<Vec<Option<HashMap<String, String>>>> {
+) -> PolarsResult<Vec<Option<ParseOutput>>> {
     let rows = string_rows(input)?;
     rows.into_iter()
         .map(|raw_value| match raw_value {
@@ -328,7 +328,7 @@ fn extract_from_string_series(
                     pattern,
                     mode,
                 )?;
-                Ok(Some(parse_output_to_row(parsed)))
+                Ok(Some(parsed))
             }
             None => Ok(None),
         })
@@ -340,7 +340,7 @@ fn extract_from_tokenized_series(
     context: &ModelContext,
     pattern: &str,
     mode: MatchMode,
-) -> PolarsResult<Vec<Option<HashMap<String, String>>>> {
+) -> PolarsResult<Vec<Option<ParseOutput>>> {
     let rows = tokenized_rows_from_struct(input)?;
     rows.into_iter()
         .map(|row| match row {
@@ -353,7 +353,7 @@ fn extract_from_tokenized_series(
                     pattern,
                     mode,
                 )?;
-                Ok(Some(parse_output_to_row(parsed)))
+                Ok(Some(parsed))
             }
             None => Ok(None),
         })
@@ -379,12 +379,6 @@ fn parse_from_tokenized_parts(
                 error
             )
         })
-}
-
-fn parse_output_to_row(output: ParseOutput) -> HashMap<String, String> {
-    let mut row = output.fields;
-    row.insert("complement".to_string(), output.complement);
-    row
 }
 
 fn tokenized_rows_from_struct(series: &Series) -> PolarsResult<Vec<Option<TokenizedRow>>> {
@@ -493,18 +487,35 @@ fn build_tokenized_struct_series(
 fn build_extract_struct_series(
     name: PlSmallStr,
     capture_names: &[String],
-    rows: &[Option<HashMap<String, String>>],
+    rows: Vec<Option<ParseOutput>>,
 ) -> PolarsResult<Series> {
-    let mut field_series = capture_names
+    let row_count = rows.len();
+    let mut field_columns = capture_names
         .iter()
-        .map(|field_name| {
+        .map(|name| (name.clone(), Vec::with_capacity(row_count)))
+        .collect::<Vec<_>>();
+    let mut complements = Vec::with_capacity(row_count);
+
+    for row in rows {
+        if let Some(output) = row {
+            for (field_name, values) in &mut field_columns {
+                values.push(output.fields.get(field_name).cloned());
+            }
+            complements.push(Some(output.complement));
+        } else {
+            for (_, values) in &mut field_columns {
+                values.push(None);
+            }
+            complements.push(None);
+        }
+    }
+
+    let mut field_series = field_columns
+        .into_iter()
+        .map(|(field_name, values)| {
             StringChunked::from_iter_options(
-                field_name.clone().into(),
-                rows.iter().map(|row| {
-                    row.as_ref()
-                        .and_then(|values| values.get(field_name))
-                        .map(String::as_str)
-                }),
+                field_name.into(),
+                values.iter().map(|value| value.as_deref()),
             )
             .into_series()
         })
@@ -513,16 +524,12 @@ fn build_extract_struct_series(
     field_series.push(
         StringChunked::from_iter_options(
             "complement".into(),
-            rows.iter().map(|row| {
-                row.as_ref()
-                    .and_then(|values| values.get("complement"))
-                    .map(String::as_str)
-            }),
+            complements.iter().map(|value| value.as_deref()),
         )
         .into_series(),
     );
 
-    Ok(StructChunked::from_series(name, rows.len(), field_series.iter())?.into_series())
+    Ok(StructChunked::from_series(name, row_count, field_series.iter())?.into_series())
 }
 
 fn build_string_list_series(name: &str, rows: impl Iterator<Item = Option<Vec<String>>>) -> Series {
