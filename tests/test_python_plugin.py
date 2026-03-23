@@ -183,6 +183,35 @@ def test_extract_plugin_accepts_compact_class_id_struct_series() -> None:
     }
 
 
+def test_extract_plugin_accepts_categorical_tokenized_struct_series() -> None:
+    frame = pl.DataFrame({"address": ["123 MAIN ST"]}).with_columns(
+        plugin_expr(
+            "tokenize_expr",
+            pl.col("address"),
+            model_path=str(MODEL_PATH),
+            include_raw_value=False,
+            token_output="categorical",
+            class_output="categorical",
+        ).alias("tokenized")
+    )
+
+    extracted = frame.select(
+        plugin_expr(
+            "extract_expr",
+            pl.col("tokenized"),
+            model_path=str(MODEL_PATH),
+            pattern=PATTERN,
+        ).alias("parsed")
+    ).unnest("parsed")
+
+    assert extracted.to_dict(as_series=False) == {
+        "CIVIC": ["123"],
+        "STREET": ["MAIN"],
+        "TYPE": ["ST"],
+        "complement": [""],
+    }
+
+
 def test_extract_plugin_respects_any_mode_for_raw_strings() -> None:
     frame = pl.DataFrame({"address": ["ATTN 123 MAIN ST"]})
 

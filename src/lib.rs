@@ -126,7 +126,10 @@ impl CompactValueCodec {
         if id == RAW_TOKEN_SENTINEL {
             Cow::Borrowed(raw_token)
         } else {
-            Cow::Borrowed(&self.values_by_id[id as usize])
+            match self.values_by_id.get(id as usize) {
+                Some(value) => Cow::Borrowed(value),
+                None => Cow::Borrowed(raw_token),
+            }
         }
     }
 }
@@ -472,7 +475,7 @@ fn tokenize_series_with_context_staged(
     build_tokenized_struct_series(input.name().clone(), columns, context, layout)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn tokenize_series_with_context_direct(
     input: &Series,
     context: &ModelContext,
@@ -968,7 +971,8 @@ fn extract_from_tokenized_series(
         .transpose()?;
     let mut field_columns = init_extract_columns(capture_names, input.len());
     let mut complements = Vec::with_capacity(input.len());
-    let mut compact_profile = profile_enabled().then(CompactExtractProfile::default);
+    let profiling = profile_enabled();
+    let mut compact_profile = profiling.then(CompactExtractProfile::default);
 
     for index in 0..input.len() {
         let raw_value = raw_iter.as_mut().and_then(Iterator::next).flatten();
@@ -977,10 +981,12 @@ fn extract_from_tokenized_series(
         let class_ids = class_id_iter.as_mut().and_then(Iterator::next);
         match (tokens, classes, class_ids) {
             (Some(Some(tokens)), Some(Some(classes)), _) => {
-                let token_values = list_series_to_str_views(&tokens)?;
-                let class_values = list_series_to_str_views(&classes)?;
-                let raw_value_buf = raw_value
-                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
+                let token_values = list_series_to_strings(&tokens)?;
+                let class_values = list_series_to_strings(&classes)?;
+                let raw_value_buf = raw_value.map_or_else(
+                    || Cow::Owned(join_string_values(&token_values)),
+                    Cow::Borrowed,
+                );
                 let parsed = parse_from_tokenized_parts(
                     context,
                     raw_value_buf,
@@ -992,26 +998,30 @@ fn extract_from_tokenized_series(
                 push_parse_output(&mut field_columns, &mut complements, Some(parsed));
             }
             (Some(Some(tokens)), _, Some(Some(class_ids))) => {
-                let token_view_start = profile_enabled().then(Instant::now);
-                let token_values = list_series_to_str_views(&tokens)?;
+                let token_view_start = profiling.then(Instant::now);
+                let token_values = list_series_to_strings(&tokens)?;
                 let token_view_elapsed = elapsed_since(token_view_start);
-                let decode_start = profile_enabled().then(Instant::now);
+                let decode_start = profiling.then(Instant::now);
                 let class_values = list_series_to_u8(&class_ids)?
                     .into_iter()
                     .zip(token_values.iter())
                     .map(|(class_id, token)| {
-                        context.class_codec.decode_or_fallback_ref(class_id, token)
+                        context
+                            .class_codec
+                            .decode_or_fallback_ref(class_id, token.as_str())
                     })
                     .collect::<Vec<_>>();
                 let decode_elapsed = elapsed_since(decode_start);
-                let raw_join_start = profile_enabled()
+                let raw_join_start = profiling
                     .then_some(raw_value.is_none())
                     .filter(|should_join| *should_join)
                     .map(|_| Instant::now());
-                let raw_value_buf = raw_value
-                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
+                let raw_value_buf = raw_value.map_or_else(
+                    || Cow::Owned(join_string_values(&token_values)),
+                    Cow::Borrowed,
+                );
                 let raw_join_elapsed = elapsed_since(raw_join_start);
-                let parse_start = profile_enabled().then(Instant::now);
+                let parse_start = profiling.then(Instant::now);
                 let parsed = parse_from_tokenized_parts(
                     context,
                     raw_value_buf,
@@ -1081,6 +1091,7 @@ fn extract_from_tokenized_series_parallel(
 ) -> PolarsResult<Series> {
     let row_count = input.len();
     let chunk_size = parallel_chunk_size(row_count);
+    let profiling = profile_enabled();
     let chunk_ranges = (0..row_count)
         .step_by(chunk_size)
         .map(|start| (start, (start + chunk_size).min(row_count)))
@@ -1103,6 +1114,7 @@ fn extract_from_tokenized_series_parallel(
                 pattern,
                 mode,
                 capture_names,
+                profiling,
                 start,
                 end,
             )
@@ -1129,7 +1141,7 @@ fn extract_from_tokenized_series_parallel(
         merged_profile.parse_ns += chunk.compact_profile.parse_ns;
     }
 
-    if profile_enabled() {
+    if profiling {
         if let Ok(stats) = context.extractor.stats() {
             eprintln!(
                 "TOKMAT_PROFILE compact rows={} token_view_ns={} class_id_decode_ns={} raw_join_ns={} parse_ns={} tokmat_profiled_rows={} tokmat_total_ns={} tokmat_class_join_ns={} tokmat_class_regex_ns={} tokmat_offset_work_ns={} tokmat_object_join_ns={} tokmat_direct_execution_ns={} tokmat_fallback_regex_ns={}",
@@ -1169,6 +1181,7 @@ fn process_extract_chunk(
     pattern: &str,
     mode: MatchMode,
     capture_names: &[String],
+    profiling: bool,
     start: usize,
     end: usize,
 ) -> PolarsResult<ChunkExtractOutput> {
@@ -1197,10 +1210,12 @@ fn process_extract_chunk(
 
         match (tokens, classes, class_ids) {
             (Some(tokens), Some(classes), _) => {
-                let token_values = list_series_to_str_views(&tokens)?;
-                let class_values = list_series_to_str_views(&classes)?;
-                let raw_value_buf = raw_value
-                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
+                let token_values = list_series_to_strings(&tokens)?;
+                let class_values = list_series_to_strings(&classes)?;
+                let raw_value_buf = raw_value.map_or_else(
+                    || Cow::Owned(join_string_values(&token_values)),
+                    Cow::Borrowed,
+                );
                 let parsed = parse_from_tokenized_parts(
                     context,
                     raw_value_buf,
@@ -1217,30 +1232,34 @@ fn process_extract_chunk(
                 );
             }
             (Some(tokens), _, Some(class_ids)) => {
-                let token_view_start = profile_enabled().then(Instant::now);
-                let token_values = list_series_to_str_views(&tokens)?;
+                let token_view_start = profiling.then(Instant::now);
+                let token_values = list_series_to_strings(&tokens)?;
                 let token_view_elapsed = elapsed_since(token_view_start);
 
-                let decode_start = profile_enabled().then(Instant::now);
+                let decode_start = profiling.then(Instant::now);
                 fill_series_u8(&class_ids, &mut class_id_values)?;
                 let class_values = class_id_values
                     .iter()
                     .zip(token_values.iter())
                     .map(|(class_id, token)| {
-                        context.class_codec.decode_or_fallback_ref(*class_id, token)
+                        context
+                            .class_codec
+                            .decode_or_fallback_ref(*class_id, token.as_str())
                     })
                     .collect::<Vec<_>>();
                 let decode_elapsed = elapsed_since(decode_start);
 
-                let raw_join_start = profile_enabled()
+                let raw_join_start = profiling
                     .then_some(raw_value.is_none())
                     .filter(|should_join| *should_join)
                     .map(|_| Instant::now());
-                let raw_value_buf = raw_value
-                    .map_or_else(|| Cow::Owned(join_str_views(&token_values)), Cow::Borrowed);
+                let raw_value_buf = raw_value.map_or_else(
+                    || Cow::Owned(join_string_values(&token_values)),
+                    Cow::Borrowed,
+                );
                 let raw_join_elapsed = elapsed_since(raw_join_start);
 
-                let parse_start = profile_enabled().then(Instant::now);
+                let parse_start = profiling.then(Instant::now);
                 let parsed = parse_from_tokenized_parts(
                     context,
                     raw_value_buf,
@@ -1310,14 +1329,35 @@ fn parse_from_tokenized_parts<T: AsRef<str>, C: AsRef<str>>(
         })
 }
 
-fn list_series_to_str_views(series: &Series) -> PolarsResult<Vec<&str>> {
-    series
-        .str()?
-        .into_iter()
-        .map(|value| {
-            value.ok_or_else(|| polars_err!(InvalidOperation: "list values may not contain nulls"))
-        })
-        .collect()
+fn list_series_to_strings(series: &Series) -> PolarsResult<Vec<String>> {
+    match series.dtype() {
+        DataType::String => series
+            .str()?
+            .into_iter()
+            .map(|value| {
+                value.map(ToString::to_string).ok_or_else(
+                    || polars_err!(InvalidOperation: "list values may not contain nulls"),
+                )
+            })
+            .collect(),
+        DataType::Categorical(_, _) | DataType::Enum(_, _) => {
+            let casted = series.cast(&DataType::String)?;
+            casted
+                .str()?
+                .into_iter()
+                .map(|value| {
+                    value.map(ToString::to_string).ok_or_else(
+                        || polars_err!(InvalidOperation: "list values may not contain nulls"),
+                    )
+                })
+                .collect()
+        }
+        dtype => polars_bail!(
+            InvalidOperation:
+            "expected String, Categorical, or Enum list values, got {:?}",
+            dtype
+        ),
+    }
 }
 
 fn list_series_to_u8(series: &Series) -> PolarsResult<Vec<u8>> {
@@ -1346,11 +1386,11 @@ fn fill_series_u8(series: &Series, buffer: &mut Vec<u8>) -> PolarsResult<()> {
     Ok(())
 }
 
-fn join_str_views(values: &[&str]) -> String {
-    let total_len = values.iter().map(|value| value.len()).sum();
+fn join_string_values<T: AsRef<str>>(values: &[T]) -> String {
+    let total_len = values.iter().map(|value| value.as_ref().len()).sum();
     let mut out = String::with_capacity(total_len);
     for value in values {
-        out.push_str(value);
+        out.push_str(value.as_ref());
     }
     out
 }
@@ -1762,9 +1802,9 @@ mod tests {
             .expect("first row should exist")
             .expect("first row should be non-null");
         let token_values =
-            list_series_to_str_views(&first_tokens).expect("list conversion should work");
-        assert!(token_values.contains(&"123"));
-        assert!(token_values.contains(&"MAIN"));
+            list_series_to_strings(&first_tokens).expect("list conversion should work");
+        assert!(token_values.contains(&"123".to_string()));
+        assert!(token_values.contains(&"MAIN".to_string()));
     }
 
     #[test]
