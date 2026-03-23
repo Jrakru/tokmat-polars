@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use tokmat::extractor::{Extractor, MatchMode, ParseOutput};
 use tokmat::tel::CompiledPattern;
 use tokmat::token_model::TokenModel;
-use tokmat::tokenizer::{TokenizedResult, tokenize_with_model};
+use tokmat::tokenizer::tokenize_with_model;
 
 static CONTEXT_CACHE: LazyLock<Mutex<HashMap<String, Arc<ModelContext>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -120,13 +120,6 @@ struct ExtractKwargs {
     mode: MatchModeKwarg,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TokenizedRow {
-    raw_value: String,
-    tokens: Vec<String>,
-    classes: Vec<String>,
-}
-
 #[allow(clippy::needless_pass_by_value)]
 #[polars_expr(output_type_func=tokenize_output_type)]
 fn tokenize_expr(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
@@ -174,18 +167,34 @@ fn extract_expr_impl(inputs: &[Series], kwargs: ExtractKwargs) -> PolarsResult<S
 }
 
 fn tokenize_series_with_context(input: &Series, context: &ModelContext) -> PolarsResult<Series> {
-    let rows = string_rows(input)?;
+    let row_count = input.len();
+    let mut raw_values = Vec::with_capacity(row_count);
+    let mut token_values = Vec::with_capacity(row_count);
+    let mut type_values = Vec::with_capacity(row_count);
+    let mut class_values = Vec::with_capacity(row_count);
 
-    let tokenized_rows = rows
-        .iter()
-        .map(|value| {
-            value
-                .as_deref()
-                .map(|raw_value| tokenize_with_model(raw_value, &context.model))
-        })
-        .collect::<Vec<_>>();
+    for value in input.str()? {
+        if let Some(raw_value) = value {
+            let tokenized = tokenize_with_model(raw_value, &context.model);
+            raw_values.push(Some(tokenized.raw_value));
+            token_values.push(Some(tokenized.tokens));
+            type_values.push(Some(tokenized.types));
+            class_values.push(Some(tokenized.classes));
+        } else {
+            raw_values.push(None);
+            token_values.push(None);
+            type_values.push(None);
+            class_values.push(None);
+        }
+    }
 
-    build_tokenized_struct_series(input.name().clone(), &rows, &tokenized_rows)
+    build_tokenized_struct_series(
+        input.name().clone(),
+        &raw_values,
+        token_values,
+        type_values,
+        class_values,
+    )
 }
 
 fn extract_series_with_context(
@@ -196,9 +205,13 @@ fn extract_series_with_context(
 ) -> PolarsResult<Series> {
     let capture_names = capture_field_names_from_pattern(pattern)?;
 
-    let parsed_rows = match input.dtype() {
-        DataType::String => extract_from_string_series(input, context, pattern, mode)?,
-        DataType::Struct(_) => extract_from_tokenized_series(input, context, pattern, mode)?,
+    match input.dtype() {
+        DataType::String => {
+            extract_from_string_series(input, context, pattern, mode, &capture_names)
+        }
+        DataType::Struct(_) => {
+            extract_from_tokenized_series(input, context, pattern, mode, &capture_names)
+        }
         dtype => {
             polars_bail!(
                 InvalidOperation:
@@ -206,9 +219,7 @@ fn extract_series_with_context(
                 dtype
             )
         }
-    };
-
-    build_extract_struct_series(input.name().clone(), &capture_names, parsed_rows)
+    }
 }
 
 fn get_or_load_context(model_path: &str) -> PolarsResult<Arc<ModelContext>> {
@@ -301,38 +312,35 @@ fn capture_field_names_from_pattern(pattern: &str) -> PolarsResult<Vec<String>> 
     Ok(fields)
 }
 
-fn string_rows(series: &Series) -> PolarsResult<Vec<Option<String>>> {
-    Ok(series
-        .str()?
-        .into_iter()
-        .map(|value| value.map(ToString::to_string))
-        .collect())
-}
-
 fn extract_from_string_series(
     input: &Series,
     context: &ModelContext,
     pattern: &str,
     mode: MatchMode,
-) -> PolarsResult<Vec<Option<ParseOutput>>> {
-    let rows = string_rows(input)?;
-    rows.into_iter()
-        .map(|raw_value| match raw_value {
+    capture_names: &[String],
+) -> PolarsResult<Series> {
+    let mut field_columns = init_extract_columns(capture_names, input.len());
+    let mut complements = Vec::with_capacity(input.len());
+
+    for raw_value in input.str()? {
+        match raw_value {
             Some(raw_value) => {
-                let tokenized = tokenize_with_model(&raw_value, &context.model);
+                let tokenized = tokenize_with_model(raw_value, &context.model);
                 let parsed = parse_from_tokenized_parts(
                     context,
-                    &raw_value,
+                    raw_value,
                     &tokenized.tokens,
                     &tokenized.classes,
                     pattern,
                     mode,
                 )?;
-                Ok(Some(parsed))
+                push_parse_output(&mut field_columns, &mut complements, Some(parsed));
             }
-            None => Ok(None),
-        })
-        .collect()
+            None => push_parse_output(&mut field_columns, &mut complements, None),
+        }
+    }
+
+    build_extract_struct_series(input.name().clone(), field_columns, &complements)
 }
 
 fn extract_from_tokenized_series(
@@ -340,24 +348,76 @@ fn extract_from_tokenized_series(
     context: &ModelContext,
     pattern: &str,
     mode: MatchMode,
-) -> PolarsResult<Vec<Option<ParseOutput>>> {
-    let rows = tokenized_rows_from_struct(input)?;
-    rows.into_iter()
-        .map(|row| match row {
-            Some(row) => {
+    capture_names: &[String],
+) -> PolarsResult<Series> {
+    let struct_chunked = input.struct_()?;
+    let fields = struct_chunked.fields_as_series();
+    let field_map = fields
+        .into_iter()
+        .map(|field| (field.name().to_string(), field))
+        .collect::<HashMap<_, _>>();
+
+    let raw_field = field_map.get("raw_value");
+    let tokens_field = field_map.get("tokens").ok_or_else(|| {
+        polars_err!(
+            InvalidOperation:
+            "tokenized struct is missing required 'tokens' field"
+        )
+    })?;
+    let classes_field = field_map.get("classes").ok_or_else(|| {
+        polars_err!(
+            InvalidOperation:
+            "tokenized struct is missing required 'classes' field"
+        )
+    })?;
+
+    let raw_values = raw_field
+        .map(|field| -> PolarsResult<Vec<Option<String>>> {
+            Ok(field
+                .str()?
+                .into_iter()
+                .map(|value| value.map(ToString::to_string))
+                .collect::<Vec<_>>())
+        })
+        .transpose()?;
+    let token_lists = tokens_field.list()?.into_iter().collect::<Vec<_>>();
+    let class_lists = classes_field.list()?.into_iter().collect::<Vec<_>>();
+    let mut field_columns = init_extract_columns(capture_names, input.len());
+    let mut complements = Vec::with_capacity(input.len());
+
+    for index in 0..input.len() {
+        match (&token_lists[index], &class_lists[index]) {
+            (Some(tokens), Some(classes)) => {
+                let token_values = list_series_to_strings(tokens)?;
+                let class_values = list_series_to_strings(classes)?;
+                let raw_value = raw_values
+                    .as_ref()
+                    .and_then(|values| values[index].clone())
+                    .unwrap_or_else(|| token_values.join(""));
                 let parsed = parse_from_tokenized_parts(
                     context,
-                    &row.raw_value,
-                    &row.tokens,
-                    &row.classes,
+                    &raw_value,
+                    &token_values,
+                    &class_values,
                     pattern,
                     mode,
                 )?;
-                Ok(Some(parsed))
+                push_parse_output(&mut field_columns, &mut complements, Some(parsed));
             }
-            None => Ok(None),
-        })
-        .collect()
+            (None, None) if raw_values.as_ref().is_none_or(|values| values[index].is_none()) => {
+                push_parse_output(&mut field_columns, &mut complements, None);
+            }
+            _ => {
+                polars_bail!(
+                    InvalidOperation:
+                    "tokenized struct row {} has inconsistent nullability across fields",
+                    index
+                )
+            }
+        }
+    }
+
+    build_extract_struct_series(input.name().clone(), field_columns, &complements)
 }
 
 fn parse_from_tokenized_parts(
@@ -381,63 +441,6 @@ fn parse_from_tokenized_parts(
         })
 }
 
-fn tokenized_rows_from_struct(series: &Series) -> PolarsResult<Vec<Option<TokenizedRow>>> {
-    let struct_chunked = series.struct_()?;
-    let fields = struct_chunked.fields_as_series();
-    let field_map = fields
-        .into_iter()
-        .map(|field| (field.name().to_string(), field))
-        .collect::<HashMap<_, _>>();
-
-    let raw_field = field_map.get("raw_value");
-    let tokens_field = field_map.get("tokens").ok_or_else(|| {
-        polars_err!(
-            InvalidOperation:
-            "tokenized struct is missing required 'tokens' field"
-        )
-    })?;
-    let classes_field = field_map.get("classes").ok_or_else(|| {
-        polars_err!(
-            InvalidOperation:
-            "tokenized struct is missing required 'classes' field"
-        )
-    })?;
-
-    let raw_values = raw_field
-        .map(string_rows)
-        .transpose()?
-        .unwrap_or_else(|| vec![None; series.len()]);
-    let token_lists = tokens_field.list()?.into_iter().collect::<Vec<_>>();
-    let class_lists = classes_field.list()?.into_iter().collect::<Vec<_>>();
-
-    let mut rows = Vec::with_capacity(series.len());
-    for index in 0..series.len() {
-        match (&token_lists[index], &class_lists[index]) {
-            (Some(tokens), Some(classes)) => {
-                let token_values = list_series_to_strings(tokens)?;
-                let raw_value = raw_values[index]
-                    .clone()
-                    .unwrap_or_else(|| token_values.join(""));
-                rows.push(Some(TokenizedRow {
-                    raw_value,
-                    tokens: token_values,
-                    classes: list_series_to_strings(classes)?,
-                }));
-            }
-            (None, None) if raw_values[index].is_none() => rows.push(None),
-            _ => {
-                polars_bail!(
-                    InvalidOperation:
-                    "tokenized struct row {} has inconsistent nullability across fields",
-                    index
-                )
-            }
-        }
-    }
-
-    Ok(rows)
-}
-
 fn list_series_to_strings(series: &Series) -> PolarsResult<Vec<String>> {
     series
         .str()?
@@ -453,7 +456,9 @@ fn list_series_to_strings(series: &Series) -> PolarsResult<Vec<String>> {
 fn build_tokenized_struct_series(
     name: PlSmallStr,
     raw_values: &[Option<String>],
-    tokenized_rows: &[Option<TokenizedResult>],
+    token_values: Vec<Option<Vec<String>>>,
+    type_values: Vec<Option<Vec<String>>>,
+    class_values: Vec<Option<Vec<String>>>,
 ) -> PolarsResult<Series> {
     let raw_series = StringChunked::from_iter_options(
         "raw_value".into(),
@@ -461,24 +466,9 @@ fn build_tokenized_struct_series(
     )
     .into_series();
 
-    let token_series = build_string_list_series(
-        "tokens",
-        tokenized_rows
-            .iter()
-            .map(|row| row.as_ref().map(|tokenized| tokenized.tokens.clone())),
-    );
-    let type_series = build_string_list_series(
-        "types",
-        tokenized_rows
-            .iter()
-            .map(|row| row.as_ref().map(|tokenized| tokenized.types.clone())),
-    );
-    let class_series = build_string_list_series(
-        "classes",
-        tokenized_rows
-            .iter()
-            .map(|row| row.as_ref().map(|tokenized| tokenized.classes.clone())),
-    );
+    let token_series = build_string_list_series("tokens", token_values);
+    let type_series = build_string_list_series("types", type_values);
+    let class_series = build_string_list_series("classes", class_values);
 
     let fields = [raw_series, token_series, type_series, class_series];
     Ok(StructChunked::from_series(name, raw_values.len(), fields.iter())?.into_series())
@@ -486,29 +476,10 @@ fn build_tokenized_struct_series(
 
 fn build_extract_struct_series(
     name: PlSmallStr,
-    capture_names: &[String],
-    rows: Vec<Option<ParseOutput>>,
+    field_columns: Vec<(String, Vec<Option<String>>)>,
+    complements: &[Option<String>],
 ) -> PolarsResult<Series> {
-    let row_count = rows.len();
-    let mut field_columns = capture_names
-        .iter()
-        .map(|name| (name.clone(), Vec::with_capacity(row_count)))
-        .collect::<Vec<_>>();
-    let mut complements = Vec::with_capacity(row_count);
-
-    for row in rows {
-        if let Some(output) = row {
-            for (field_name, values) in &mut field_columns {
-                values.push(output.fields.get(field_name).cloned());
-            }
-            complements.push(Some(output.complement));
-        } else {
-            for (_, values) in &mut field_columns {
-                values.push(None);
-            }
-            complements.push(None);
-        }
-    }
+    let row_count = complements.len();
 
     let mut field_series = field_columns
         .into_iter()
@@ -532,8 +503,37 @@ fn build_extract_struct_series(
     Ok(StructChunked::from_series(name, row_count, field_series.iter())?.into_series())
 }
 
-fn build_string_list_series(name: &str, rows: impl Iterator<Item = Option<Vec<String>>>) -> Series {
+fn init_extract_columns(
+    capture_names: &[String],
+    row_count: usize,
+) -> Vec<(String, Vec<Option<String>>)> {
+    capture_names
+        .iter()
+        .map(|name| (name.clone(), Vec::with_capacity(row_count)))
+        .collect()
+}
+
+fn push_parse_output(
+    field_columns: &mut [(String, Vec<Option<String>>)],
+    complements: &mut Vec<Option<String>>,
+    output: Option<ParseOutput>,
+) {
+    if let Some(output) = output {
+        for (field_name, values) in field_columns.iter_mut() {
+            values.push(output.fields.get(field_name).cloned());
+        }
+        complements.push(Some(output.complement));
+    } else {
+        for (_, values) in field_columns.iter_mut() {
+            values.push(None);
+        }
+        complements.push(None);
+    }
+}
+
+fn build_string_list_series(name: &str, rows: Vec<Option<Vec<String>>>) -> Series {
     let mut series = rows
+        .into_iter()
         .map(|row| row.map(|values| Series::new(PlSmallStr::EMPTY, values)))
         .collect::<ListChunked>()
         .into_series();
@@ -674,7 +674,7 @@ mod tests {
                 " ".to_string(),
                 "ST".to_string(),
             ])]
-            .into_iter(),
+            .to_vec(),
         );
         let classes = build_string_list_series(
             "classes",
@@ -685,7 +685,7 @@ mod tests {
                 " ".to_string(),
                 "STREETTYPE".to_string(),
             ])]
-            .into_iter(),
+            .to_vec(),
         );
         let tokenized = StructChunked::from_series("address".into(), 1, [tokens, classes].iter())
             .expect("struct should build")
