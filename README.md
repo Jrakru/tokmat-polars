@@ -62,24 +62,51 @@ the `PyPI` project settings and set the workflow environment to `pypi` if `PyPI`
 prompts for it. For crates.io, create an API token and store it in GitHub as
 `CARGO_REGISTRY_TOKEN`.
 
-Minimal Python usage:
+## Python usage
+
+Use the wrapper functions — `tokenize`, `extract`, `encode_class_ids`. They
+register the plugin expressions with `is_elementwise=True`, so the Polars engine
+can stream them and parallelize across chunks on its own thread pool:
 
 ```python
-from pathlib import Path
-
 import polars as pl
-import tokmat_polars
+import tokmat_polars as tk
 
-plugin_path = Path(tokmat_polars.__file__).parent
+MODEL = "/path/to/model"
+PATTERN = "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>"
 
-expr = pl.plugins.register_plugin_function(
-    plugin_path=plugin_path,
-    function_name="tokenize_expr",
-    args=pl.col("address"),
-    kwargs={"model_path": "/path/to/model"},
-    use_abs_path=True,
-)
+lf = pl.LazyFrame({"address": ["ATTN 123 MAIN ST"]})
+
+# tokenize -> struct(raw_value, tokens, types, classes); unnest for flat columns
+tok = lf.select(tk.tokenize(pl.col("address"), model_path=MODEL).alias("t")).unnest("t")
+
+# extract -> struct(capture fields..., complement)
+parsed = lf.select(
+    tk.extract(pl.col("address"), model_path=MODEL, pattern=PATTERN, mode="any").alias("p")
+).unnest("p")
 ```
+
+### Use the streaming engine for large data
+
+Because the expressions are elementwise, the streaming engine parallelizes them
+and keeps memory bounded. On a 1M-row benchmark (`benchmarks/bench_polars_engine.py`),
+extraction is **~7× faster** under streaming and uses near-zero extra memory:
+
+```python
+parsed.collect(engine="streaming")   # parallel + bounded memory
+```
+
+| 1M rows | in-memory | streaming |
+| --- | --- | --- |
+| `tokenize` | 4.7 s, +298 MB | 4.3 s, **+43 MB** |
+| `extract`  | 35.6 s | **4.9 s**, +0 MB |
+
+`is_elementwise=False` (raw `register_plugin_function` without the flag) forfeits
+this — streaming can't engage and extraction stays at ~36 s. The wrapper sets the
+flag for you; prefer it over registering the plugin by hand.
+
+The word definition is also exposed: `tk.model_word_definition(path)`,
+`tk.get_word_definition()`, `tk.set_word_definition(chars)`.
 
 ## Plugin API
 

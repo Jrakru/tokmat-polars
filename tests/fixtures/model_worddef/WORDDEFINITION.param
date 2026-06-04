@@ -1,0 +1,2 @@
+# word character class: digits/letters/underscore, hyphen, apostrophe, AND period
+[\w\-'.]

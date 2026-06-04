@@ -6,3 +6,8 @@ dist/
 
 __pycache__/
 *.pyc
+
+# Compiled extension dropped into the package dir by `maturin develop` (editable)
+python/tokmat_polars/*.so
+python/tokmat_polars/*.pyd
+python/tokmat_polars/*.dll
