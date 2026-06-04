@@ -53,8 +53,8 @@ the Rust crate to crates.io using a `CARGO_REGISTRY_TOKEN` GitHub secret.
 Release steps:
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 Before the first release, configure this repository as a Trusted Publisher in

@@ -12,6 +12,11 @@ jobs:
   build:
     name: Build distributions (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Statically link the patched vendored PCRE2 (>= 10.46) into the wheels
+      # rather than a possibly-vulnerable system libpcre2-8 (CVE-2025-58050).
+      # Also makes the wheels self-contained / more portable.
+      PCRE2_SYS_STATIC: "1"
     strategy:
       fail-fast: false
       matrix:
