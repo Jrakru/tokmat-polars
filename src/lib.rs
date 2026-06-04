@@ -1,4 +1,10 @@
 #![doc = include_str!("../README.md")]
+// The pyo3 0.22 `#[pyfunction]` macro (under edition 2024) generates an unsafe
+// trampoline that omits inner `unsafe` blocks and a redundant `PyErr` conversion,
+// tripping `unsafe_op_in_unsafe_fn` and `clippy::useless_conversion`. These fire
+// on macro-generated code only; our hand-written unsafe uses explicit
+// `unsafe { .. }` blocks, so allowing them crate-wide hides nothing real.
+#![allow(unsafe_op_in_unsafe_fn, clippy::useless_conversion)]
 
 //! Polars integration for tokmat, usable from both Rust and Python.
 
@@ -17,7 +23,8 @@ use std::time::{Duration, Instant};
 use tokmat::extractor::{Extractor, MatchMode, ParseOutput};
 use tokmat::tel::CompiledPattern;
 use tokmat::token_model::TokenModel;
-use tokmat::tokenizer::{split_input_tokens, tokenize_with_model};
+use tokmat::tokenizer::{split_input_tokens_with, tokenize_with_model};
+use tokmat::word_definition::configure_word_definition;
 
 static CONTEXT_CACHE: LazyLock<Mutex<HashMap<String, Arc<ModelContext>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -30,6 +37,7 @@ struct ModelContext {
     class_codec: CompactValueCodec,
     type_enum_values: Vec<String>,
     class_enum_values: Vec<String>,
+    word_definition: WordDefinition,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -156,7 +164,6 @@ impl TokenizeLayout {
 #[allow(clippy::struct_field_names)]
 #[derive(Debug)]
 struct TokenizedColumns {
-    raw_values: Option<Vec<Option<String>>>,
     token_values: Vec<Option<Vec<String>>>,
     type_values: Option<Vec<Option<Vec<String>>>>,
     class_values: Option<Vec<Option<Vec<String>>>>,
@@ -166,7 +173,6 @@ struct TokenizedColumns {
 
 #[derive(Debug)]
 struct TokenizedRow {
-    raw_value: Option<String>,
     tokens: Vec<String>,
     types: Option<Vec<String>>,
     classes: Option<Vec<String>>,
@@ -258,7 +264,19 @@ impl TokmatPolars {
         let _ = &self.context;
         capture_field_names_from_pattern(pattern)
     }
+
+    /// The active word definition for this model — the character class (without
+    /// brackets, e.g. `\w\-'`) that delimits tokens. Loaded from the model's
+    /// `WORDDEFINITION.param`, or the default if absent.
+    #[must_use]
+    pub fn word_definition(&self) -> &str {
+        self.context.word_definition.chars()
+    }
 }
+
+// Re-export so Rust callers can construct/inspect word definitions without
+// depending on `tokmat` directly.
+pub use tokmat::word_definition::WordDefinition;
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize)]
@@ -339,6 +357,11 @@ struct ExtractKwargs {
     mode: MatchModeKwarg,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct EncodeClassIdsKwargs {
+    model_path: String,
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[polars_expr(output_type_func_with_kwargs=tokenize_output_type)]
 fn tokenize_expr(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
@@ -351,9 +374,53 @@ fn extract_expr(inputs: &[Series], kwargs: ExtractKwargs) -> PolarsResult<Series
     extract_expr_impl(inputs, kwargs)
 }
 
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::needless_pass_by_value)]
+#[polars_expr(output_type_func_with_kwargs=encode_class_ids_output_type)]
+fn encode_class_ids_expr(inputs: &[Series], kwargs: EncodeClassIdsKwargs) -> PolarsResult<Series> {
+    encode_class_ids_expr_impl(inputs, &kwargs)
+}
+
+/// Return the word-definition character class for a model (from its
+/// `WORDDEFINITION.param`, or the default `\w\-'` if absent).
+#[pyfunction]
+fn model_word_definition(model_path: &str) -> PyResult<String> {
+    let context = get_or_load_context(model_path)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    Ok(context.word_definition.chars().to_string())
+}
+
+/// Read the process-global word definition (the character class string).
+///
+/// Note: model tokenization uses each model's own boundary, not this global;
+/// this reflects the last value set via [`set_word_definition`] (or the default).
+#[pyfunction]
+fn get_word_definition() -> String {
+    tokmat::word_definition::word_definition()
+        .chars()
+        .to_string()
+}
+
+/// Set the process-global word definition (character class, with or without
+/// surrounding brackets, e.g. `\w\-'.` or `[\w\-'.]`).
+///
+/// This affects the global-reading TEL/extractor path. It is process-wide and
+/// not thread-scoped; prefer driving word definitions via a model's
+/// `WORDDEFINITION.param`.
+#[pyfunction]
+fn set_word_definition(chars: &str) {
+    configure_word_definition(WordDefinition::new(chars));
+}
+
+// The compiled extension is a private submodule (`tokmat_polars._tokmat_polars`)
+// of the `tokmat_polars` Python package. The package's `__init__.py` provides the
+// user-facing API (which registers the plugin expressions with
+// `is_elementwise=True`). Polars loads the plugin functions from this compiled
+// module via its path.
 #[pymodule]
-fn tokmat_polars(_py: Python<'_>, _module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _tokmat_polars(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(pyo3::wrap_pyfunction!(model_word_definition, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(get_word_definition, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(set_word_definition, module)?)?;
     Ok(())
 }
 
@@ -378,6 +445,18 @@ fn extract_output_type(input_fields: &[Field], kwargs: ExtractKwargs) -> PolarsR
     ))
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn encode_class_ids_output_type(
+    input_fields: &[Field],
+    _kwargs: EncodeClassIdsKwargs,
+) -> PolarsResult<Field> {
+    let output_name = output_field_name(input_fields, "class_ids");
+    Ok(Field::new(
+        output_name,
+        DataType::List(Box::new(DataType::UInt8)),
+    ))
+}
+
 fn tokenize_expr_impl(inputs: &[Series], kwargs: &TokenizeKwargs) -> PolarsResult<Series> {
     let input = single_input(inputs, "tokenize_expr")?;
     let context = get_or_load_context(&kwargs.model_path)?;
@@ -390,7 +469,42 @@ fn extract_expr_impl(inputs: &[Series], kwargs: ExtractKwargs) -> PolarsResult<S
     extract_series_with_context(input, &context, &kwargs.pattern, kwargs.mode.into())
 }
 
+fn encode_class_ids_expr_impl(
+    inputs: &[Series],
+    kwargs: &EncodeClassIdsKwargs,
+) -> PolarsResult<Series> {
+    let input = single_input(inputs, "encode_class_ids_expr")?;
+    let context = get_or_load_context(&kwargs.model_path)?;
+    let mut rows = Vec::with_capacity(input.len());
+    for row in input.list()? {
+        match row {
+            Some(classes) => {
+                let class_values = list_series_to_str_views(&classes)?;
+                rows.push(Some(
+                    class_values
+                        .into_iter()
+                        .map(|value| context.class_codec.encode_known_or_raw(value))
+                        .collect(),
+                ));
+            }
+            None => rows.push(None),
+        }
+    }
+    Ok(build_u8_list_series(input.name(), rows))
+}
+
 fn tokenize_series_with_context(
+    input: &Series,
+    context: &ModelContext,
+    layout: TokenizeLayout,
+) -> PolarsResult<Series> {
+    if should_parallelize_tokenize(input.len()) {
+        return tokenize_series_parallel(input, context, layout);
+    }
+    tokenize_series_serial(input, context, layout)
+}
+
+fn tokenize_series_serial(
     input: &Series,
     context: &ModelContext,
     layout: TokenizeLayout,
@@ -398,8 +512,49 @@ fn tokenize_series_with_context(
     if can_tokenize_direct(layout) {
         return tokenize_series_with_context_direct(input, context, layout);
     }
-
     tokenize_series_with_context_staged(input, context, layout)
+}
+
+/// Tokenize row-range chunks in parallel, then concatenate. Rows are
+/// independent, so each chunk runs the full serial path over a zero-copy slice
+/// of the input and the resulting struct chunks are appended in order.
+fn tokenize_series_parallel(
+    input: &Series,
+    context: &ModelContext,
+    layout: TokenizeLayout,
+) -> PolarsResult<Series> {
+    tokenize_series_chunked(input, context, layout, parallel_chunk_size(input.len()))
+}
+
+fn tokenize_series_chunked(
+    input: &Series,
+    context: &ModelContext,
+    layout: TokenizeLayout,
+    chunk_size: usize,
+) -> PolarsResult<Series> {
+    let row_count = input.len();
+    let chunk_series = (0..row_count)
+        .step_by(chunk_size)
+        .map(|start| (start, (start + chunk_size).min(row_count)))
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(start, end)| {
+            let slice = input.slice(
+                i64::try_from(start).expect("row index fits in i64"),
+                end - start,
+            );
+            tokenize_series_serial(&slice, context, layout)
+        })
+        .collect::<PolarsResult<Vec<_>>>()?;
+
+    let mut chunks = chunk_series.into_iter();
+    let mut combined = chunks
+        .next()
+        .expect("row_count >= PARALLEL_ROW_THRESHOLD guarantees at least one chunk");
+    for chunk in chunks {
+        combined.append(&chunk)?;
+    }
+    Ok(combined)
 }
 
 fn can_tokenize_direct(layout: TokenizeLayout) -> bool {
@@ -415,9 +570,6 @@ fn tokenize_series_with_context_staged(
 ) -> PolarsResult<Series> {
     let row_count = input.len();
     let mut columns = TokenizedColumns {
-        raw_values: layout
-            .include_raw_value
-            .then(|| Vec::with_capacity(row_count)),
         token_values: Vec::with_capacity(row_count),
         type_values: layout
             .needs_type_values()
@@ -436,9 +588,6 @@ fn tokenize_series_with_context_staged(
     for value in input.str()? {
         if let Some(raw_value) = value {
             let tokenized = tokenize_row(raw_value, context, layout);
-            if let Some(raw_values) = columns.raw_values.as_mut() {
-                raw_values.push(tokenized.raw_value);
-            }
             columns.token_values.push(Some(tokenized.tokens));
             if let Some(type_values) = columns.type_values.as_mut() {
                 type_values.push(tokenized.types);
@@ -453,9 +602,6 @@ fn tokenize_series_with_context_staged(
                 class_id_values.push(tokenized.class_ids);
             }
         } else {
-            if let Some(raw_values) = columns.raw_values.as_mut() {
-                raw_values.push(None);
-            }
             columns.token_values.push(None);
             if let Some(type_values) = columns.type_values.as_mut() {
                 type_values.push(None);
@@ -472,7 +618,7 @@ fn tokenize_series_with_context_staged(
         }
     }
 
-    build_tokenized_struct_series(input.name().clone(), columns, context, layout)
+    build_tokenized_struct_series(input, columns, context, layout)
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
@@ -489,9 +635,6 @@ fn tokenize_series_with_context_direct(
         .map(str::len)
         .sum::<usize>();
 
-    let mut raw_values = layout
-        .include_raw_value
-        .then(|| Vec::with_capacity(row_count));
     let mut token_builder =
         ListStringChunkedBuilder::new("tokens".into(), row_count, input_total_bytes);
     let mut type_builder = layout
@@ -519,11 +662,7 @@ fn tokenize_series_with_context_direct(
 
     for value in input.str()? {
         if let Some(raw_value) = value {
-            if let Some(values) = raw_values.as_mut() {
-                values.push(Some(raw_value.to_string()));
-            }
-
-            let tokens = split_input_tokens(raw_value);
+            let tokens = split_input_tokens_with(raw_value, context.model.word_boundary());
             token_builder.append_values_iter(tokens.iter().map(String::as_str));
 
             let needs_row_types = layout.include_types || layout.include_type_ids;
@@ -598,9 +737,6 @@ fn tokenize_series_with_context_direct(
                 }
             }
         } else {
-            if let Some(values) = raw_values.as_mut() {
-                values.push(None);
-            }
             token_builder.append_null();
             if let Some(builder) = type_builder.as_mut() {
                 builder.append_null();
@@ -618,14 +754,13 @@ fn tokenize_series_with_context_direct(
     }
 
     let mut fields = Vec::new();
-    if let Some(raw_values) = raw_values {
-        fields.push(
-            StringChunked::from_iter_options(
-                "raw_value".into(),
-                raw_values.iter().map(|value| value.as_deref()),
-            )
-            .into_series(),
-        );
+    if layout.include_raw_value {
+        // `raw_value` is byte-for-byte the input column, so reuse the existing
+        // Arrow buffers (Arc clone + rename) instead of reconstructing and
+        // re-copying the whole column cell by cell.
+        let mut raw = input.clone();
+        raw.rename("raw_value".into());
+        fields.push(raw);
     }
     fields.push(token_builder.finish().into_series());
     if let Some(mut builder) = type_builder {
@@ -650,6 +785,15 @@ fn extract_series_with_context(
     pattern: &str,
     mode: MatchMode,
 ) -> PolarsResult<Series> {
+    // The TEL compiler and object-plan builder still read the process-global word
+    // definition. Re-apply this model's definition for the duration of the call so
+    // extraction honors the model's `WORDDEFINITION.param` rather than whatever was
+    // configured last. (Tokenization is already per-model via `word_boundary`.)
+    // Residual: truly concurrent extraction of *different* models in one process
+    // can still race the global — full isolation needs the word definition threaded
+    // through `CompiledPattern::compile` / the `Extractor`. See the perf report.
+    configure_word_definition(context.word_definition.clone());
+
     let capture_names = capture_field_names_from_pattern(pattern)?;
 
     match input.dtype() {
@@ -708,6 +852,7 @@ fn get_or_load_context(model_path: &str) -> PolarsResult<Arc<ModelContext>> {
     let class_enum_values = enum_categories(class_vocab.into_iter().chain([" ".to_string()]));
 
     let features = ModelFeatures::from_model(&model);
+    let word_definition = model.word_definition().clone();
     let context = Arc::new(ModelContext {
         model,
         extractor,
@@ -716,6 +861,7 @@ fn get_or_load_context(model_path: &str) -> PolarsResult<Arc<ModelContext>> {
         class_codec,
         type_enum_values,
         class_enum_values,
+        word_definition,
     });
     cache.insert(model_path.to_string(), Arc::clone(&context));
     Ok(context)
@@ -890,28 +1036,50 @@ fn extract_from_string_series(
     mode: MatchMode,
     capture_names: &[String],
 ) -> PolarsResult<Series> {
-    let mut field_columns = init_extract_columns(capture_names, input.len());
-    let mut complements = Vec::with_capacity(input.len());
+    let row_count = input.len();
+    let compiled_pattern = compile_extract_pattern(pattern)?;
+    let extractor = &context.extractor;
+    let mut builders = ExtractColumnBuilders::new(capture_names, row_count);
 
     for raw_value in input.str()? {
         match raw_value {
             Some(raw_value) => {
                 let tokenized = tokenize_with_model(raw_value, &context.model);
                 let parsed = parse_from_tokenized_parts(
-                    context,
+                    extractor,
                     raw_value,
                     &tokenized.tokens,
                     &tokenized.classes,
-                    pattern,
+                    &compiled_pattern,
                     mode,
                 )?;
-                push_parse_output(&mut field_columns, &mut complements, Some(parsed));
+                builders.push(capture_names, Some(parsed));
             }
-            None => push_parse_output(&mut field_columns, &mut complements, None),
+            None => builders.push(capture_names, None),
         }
     }
 
-    build_extract_struct_series(input.name().clone(), field_columns, &complements)
+    builders.finish(input.name().clone(), row_count)
+}
+
+/// Ensure a tokenized struct list-field is `List(String)`.
+///
+/// Token/class columns can be `List(Categorical)` or `List(Enum)` (categorical
+/// tokenize output), but the borrowing `&str`-view extraction path requires
+/// `List(String)`. Cast such a column to `List(String)` once (rather than per
+/// row); a `List(String)` column is returned as a cheap clone (no data copy).
+fn ensure_string_list_field(field: &Series) -> PolarsResult<Series> {
+    match field.dtype() {
+        DataType::List(inner)
+            if matches!(
+                inner.as_ref(),
+                DataType::Categorical(_, _) | DataType::Enum(_, _)
+            ) =>
+        {
+            field.cast(&DataType::List(Box::new(DataType::String)))
+        }
+        _ => Ok(field.clone()),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -945,7 +1113,13 @@ fn extract_from_tokenized_series(
         );
     }
 
-    if should_parallelize(input.len()) {
+    // Token/class columns may be categorical/enum lists (from categorical
+    // tokenize output); the `&str`-view path needs `List(String)`. Cast once here
+    // so both the serial and parallel paths below see String lists.
+    let tokens_field = ensure_string_list_field(tokens_field)?;
+    let classes_field = classes_field.map(ensure_string_list_field).transpose()?;
+
+    if should_parallelize_extract(input.len()) {
         return extract_from_tokenized_series_parallel(
             input,
             context,
@@ -953,8 +1127,8 @@ fn extract_from_tokenized_series(
             mode,
             capture_names,
             raw_field,
-            tokens_field,
-            classes_field,
+            &tokens_field,
+            classes_field.as_ref(),
             class_ids_field,
         );
     }
@@ -964,13 +1138,16 @@ fn extract_from_tokenized_series(
         .transpose()?;
     let mut token_iter = tokens_field.list()?.into_iter();
     let mut class_iter = classes_field
+        .as_ref()
         .map(|field| field.list().map(IntoIterator::into_iter))
         .transpose()?;
     let mut class_id_iter = class_ids_field
         .map(|field| field.list().map(IntoIterator::into_iter))
         .transpose()?;
-    let mut field_columns = init_extract_columns(capture_names, input.len());
-    let mut complements = Vec::with_capacity(input.len());
+    let row_count = input.len();
+    let compiled_pattern = compile_extract_pattern(pattern)?;
+    let extractor = &context.extractor;
+    let mut builders = ExtractColumnBuilders::new(capture_names, row_count);
     let profiling = profile_enabled();
     let mut compact_profile = profiling.then(CompactExtractProfile::default);
 
@@ -981,34 +1158,32 @@ fn extract_from_tokenized_series(
         let class_ids = class_id_iter.as_mut().and_then(Iterator::next);
         match (tokens, classes, class_ids) {
             (Some(Some(tokens)), Some(Some(classes)), _) => {
-                let token_values = list_series_to_strings(&tokens)?;
-                let class_values = list_series_to_strings(&classes)?;
+                let token_values = list_series_to_str_views(&tokens)?;
+                let class_values = list_series_to_str_views(&classes)?;
                 let raw_value_buf = raw_value.map_or_else(
                     || Cow::Owned(join_string_values(&token_values)),
                     Cow::Borrowed,
                 );
                 let parsed = parse_from_tokenized_parts(
-                    context,
+                    extractor,
                     raw_value_buf,
                     &token_values,
                     &class_values,
-                    pattern,
+                    &compiled_pattern,
                     mode,
                 )?;
-                push_parse_output(&mut field_columns, &mut complements, Some(parsed));
+                builders.push(capture_names, Some(parsed));
             }
             (Some(Some(tokens)), _, Some(Some(class_ids))) => {
                 let token_view_start = profiling.then(Instant::now);
-                let token_values = list_series_to_strings(&tokens)?;
+                let token_values = list_series_to_str_views(&tokens)?;
                 let token_view_elapsed = elapsed_since(token_view_start);
                 let decode_start = profiling.then(Instant::now);
                 let class_values = list_series_to_u8(&class_ids)?
                     .into_iter()
-                    .zip(token_values.iter())
+                    .zip(token_values.iter().copied())
                     .map(|(class_id, token)| {
-                        context
-                            .class_codec
-                            .decode_or_fallback_ref(class_id, token.as_str())
+                        context.class_codec.decode_or_fallback_ref(class_id, token)
                     })
                     .collect::<Vec<_>>();
                 let decode_elapsed = elapsed_since(decode_start);
@@ -1023,11 +1198,11 @@ fn extract_from_tokenized_series(
                 let raw_join_elapsed = elapsed_since(raw_join_start);
                 let parse_start = profiling.then(Instant::now);
                 let parsed = parse_from_tokenized_parts(
-                    context,
+                    extractor,
                     raw_value_buf,
                     &token_values,
                     &class_values,
-                    pattern,
+                    &compiled_pattern,
                     mode,
                 )?;
                 let parse_elapsed = elapsed_since(parse_start);
@@ -1038,10 +1213,10 @@ fn extract_from_tokenized_series(
                     profile.raw_join_ns += raw_join_elapsed;
                     profile.parse_ns += parse_elapsed;
                 }
-                push_parse_output(&mut field_columns, &mut complements, Some(parsed));
+                builders.push(capture_names, Some(parsed));
             }
             (Some(None), Some(None) | None, Some(None) | None) if raw_value.is_none() => {
-                push_parse_output(&mut field_columns, &mut complements, None);
+                builders.push(capture_names, None);
             }
             _ => {
                 polars_bail!(
@@ -1074,7 +1249,7 @@ fn extract_from_tokenized_series(
         }
     }
 
-    build_extract_struct_series(input.name().clone(), field_columns, &complements)
+    builders.finish(input.name().clone(), row_count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1197,6 +1372,12 @@ fn process_extract_chunk(
     let mut complements = Vec::with_capacity(end - start);
     let mut compact_profile = CompactExtractProfile::default();
     let mut class_id_values = Vec::new();
+    let compiled_pattern = compile_extract_pattern(pattern)?;
+    // Per-chunk extractor: its own caches, so rayon workers never contend on the
+    // shared extractor's Mutex-guarded plan/regex caches (the root cause of the
+    // parallel-extract regression). See `fresh_chunk_extractor`.
+    let chunk_extractor = fresh_chunk_extractor(context);
+    let extractor = &chunk_extractor;
 
     for index in start..end {
         let raw_value = raw_utf8.as_ref().and_then(|values| values.get(index));
@@ -1210,18 +1391,18 @@ fn process_extract_chunk(
 
         match (tokens, classes, class_ids) {
             (Some(tokens), Some(classes), _) => {
-                let token_values = list_series_to_strings(&tokens)?;
-                let class_values = list_series_to_strings(&classes)?;
+                let token_values = list_series_to_str_views(&tokens)?;
+                let class_values = list_series_to_str_views(&classes)?;
                 let raw_value_buf = raw_value.map_or_else(
                     || Cow::Owned(join_string_values(&token_values)),
                     Cow::Borrowed,
                 );
                 let parsed = parse_from_tokenized_parts(
-                    context,
+                    extractor,
                     raw_value_buf,
                     &token_values,
                     &class_values,
-                    pattern,
+                    &compiled_pattern,
                     mode,
                 )?;
                 push_parse_output_by_index(
@@ -1233,18 +1414,16 @@ fn process_extract_chunk(
             }
             (Some(tokens), _, Some(class_ids)) => {
                 let token_view_start = profiling.then(Instant::now);
-                let token_values = list_series_to_strings(&tokens)?;
+                let token_values = list_series_to_str_views(&tokens)?;
                 let token_view_elapsed = elapsed_since(token_view_start);
 
                 let decode_start = profiling.then(Instant::now);
                 fill_series_u8(&class_ids, &mut class_id_values)?;
                 let class_values = class_id_values
                     .iter()
-                    .zip(token_values.iter())
+                    .zip(token_values.iter().copied())
                     .map(|(class_id, token)| {
-                        context
-                            .class_codec
-                            .decode_or_fallback_ref(*class_id, token.as_str())
+                        context.class_codec.decode_or_fallback_ref(*class_id, token)
                     })
                     .collect::<Vec<_>>();
                 let decode_elapsed = elapsed_since(decode_start);
@@ -1261,11 +1440,11 @@ fn process_extract_chunk(
 
                 let parse_start = profiling.then(Instant::now);
                 let parsed = parse_from_tokenized_parts(
-                    context,
+                    extractor,
                     raw_value_buf,
                     &token_values,
                     &class_values,
-                    pattern,
+                    &compiled_pattern,
                     mode,
                 )?;
                 let parse_elapsed = elapsed_since(parse_start);
@@ -1309,26 +1488,63 @@ fn process_extract_chunk(
 }
 
 fn parse_from_tokenized_parts<T: AsRef<str>, C: AsRef<str>>(
-    context: &ModelContext,
+    extractor: &Extractor,
     raw_value: impl AsRef<str>,
     tokens: &[T],
     classes: &[C],
-    pattern: &str,
+    compiled_pattern: &CompiledPattern,
     mode: MatchMode,
 ) -> PolarsResult<ParseOutput> {
-    context
-        .extractor
-        .parse_tokens_with_views(raw_value.as_ref(), tokens, classes, pattern, mode)
-        .map_err(|error| {
-            polars_err!(
-                ComputeError:
-                "failed to extract TEL pattern '{}': {}",
-                pattern,
-                error
-            )
-        })
+    // Uses the precompiled pattern so the per-row hot loop does not take the
+    // extractor's `compiled_pattern_cache` lock (the pattern is identical for
+    // every row of a call). See `compile_extract_pattern`. The `extractor` may be
+    // the shared one (serial) or a per-chunk one (parallel) to avoid cache-lock
+    // contention across rayon workers.
+    extractor
+        .parse_compiled_tokens_with_views(
+            raw_value.as_ref(),
+            tokens,
+            classes,
+            compiled_pattern,
+            mode,
+        )
+        .map_err(|error| polars_err!(ComputeError: "failed to extract TEL pattern: {}", error))
 }
 
+/// Build a fresh `Extractor` that shares the model's token definitions/classes
+/// but has its own (empty) plan/regex caches. Used per parallel chunk so rayon
+/// workers never contend on the shared extractor's `Mutex`-guarded caches.
+fn fresh_chunk_extractor(context: &ModelContext) -> Extractor {
+    Extractor::new(
+        context.model.token_definitions().clone(),
+        context.model.token_class_list().clone(),
+    )
+}
+
+/// Compile the TEL pattern once per extract call (hoisted out of the row loop).
+fn compile_extract_pattern(pattern: &str) -> PolarsResult<CompiledPattern> {
+    CompiledPattern::compile(pattern).map_err(
+        |error| polars_err!(ComputeError: "failed to compile TEL pattern '{}': {}", pattern, error),
+    )
+}
+
+/// Borrow the row's string list values as `&str` views into `series` instead of
+/// allocating an owned `String` per token. The extraction/parse path is generic
+/// over `AsRef<str>`, so views work unchanged -- this removes ~2 owned-String
+/// allocations per token per row (the dominant per-row allocation in the hot
+/// extraction loop). Requires a `String`-typed list (callers cast categorical
+/// token/class columns to `List(String)` upstream).
+fn list_series_to_str_views(series: &Series) -> PolarsResult<Vec<&str>> {
+    series
+        .str()?
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| polars_err!(InvalidOperation: "list values may not contain nulls"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn list_series_to_strings(series: &Series) -> PolarsResult<Vec<String>> {
     match series.dtype() {
         DataType::String => series
@@ -1396,20 +1612,46 @@ fn join_string_values<T: AsRef<str>>(values: &[T]) -> String {
 }
 
 fn profile_enabled() -> bool {
-    std::env::var("TOKMAT_PROFILE")
-        .map(|value| value != "0" && !value.is_empty())
-        .unwrap_or(false)
+    std::env::var("TOKMAT_PROFILE").is_ok_and(|value| value != "0" && !value.is_empty())
 }
 
-fn should_parallelize(row_count: usize) -> bool {
-    let rayon_enabled = std::env::var("TOKMAT_ENABLE_RAYON")
-        .map(|value| value != "0" && !value.is_empty())
-        .unwrap_or(false);
+/// Minimum row count before splitting work across rayon threads. Below this the
+/// thread-coordination overhead outweighs the gain, so we stay single-threaded.
+const PARALLEL_ROW_THRESHOLD: usize = 100_000;
 
-    rayon_enabled
-        && std::env::var("TOKMAT_DISABLE_RAYON").is_err()
+/// True when we are already executing on a rayon worker thread — i.e. the caller
+/// (e.g. the Polars engine, which parallelizes elementwise expressions across
+/// chunks on its own pool) is already parallelizing. In that case the plugin must
+/// NOT spawn its own rayon work, or it oversubscribes / nests pools. The internal
+/// parallelism is therefore an eager, top-level-only fallback (useful for the
+/// direct Rust API on a single-chunk column); when driven through Polars,
+/// `is_elementwise` lets the engine do the parallelism instead.
+fn running_inside_rayon_pool() -> bool {
+    rayon::current_thread_index().is_some()
+}
+
+/// Tokenization is embarrassingly parallel and shares no mutable state, so it is
+/// parallel by default for large inputs *when called at top level*.
+/// `TOKMAT_DISABLE_RAYON` opts out.
+fn should_parallelize_tokenize(row_count: usize) -> bool {
+    std::env::var_os("TOKMAT_DISABLE_RAYON").is_none()
+        && !running_inside_rayon_pool()
         && rayon::current_num_threads() > 1
-        && row_count >= 100_000
+        && row_count >= PARALLEL_ROW_THRESHOLD
+}
+
+/// Extraction is **opt-in** parallel (`TOKMAT_ENABLE_RAYON`). Unlike tokenize,
+/// the per-row extract path hammers the `Extractor`'s `Mutex`-guarded plan/regex
+/// caches; on high-cardinality (cache-missing) inputs the lock contention makes
+/// parallel extraction much slower than serial. It only pays off for
+/// low-cardinality workloads whose plans stay cache-resident, so callers must
+/// enable it explicitly.
+fn should_parallelize_extract(row_count: usize) -> bool {
+    std::env::var_os("TOKMAT_ENABLE_RAYON").is_some()
+        && std::env::var_os("TOKMAT_DISABLE_RAYON").is_none()
+        && !running_inside_rayon_pool()
+        && rayon::current_num_threads() > 1
+        && row_count >= PARALLEL_ROW_THRESHOLD
 }
 
 fn parallel_chunk_size(row_count: usize) -> usize {
@@ -1422,7 +1664,7 @@ fn elapsed_since(start: Option<Instant>) -> Duration {
 }
 
 fn build_tokenized_struct_series(
-    name: PlSmallStr,
+    input: &Series,
     columns: TokenizedColumns,
     context: &ModelContext,
     layout: TokenizeLayout,
@@ -1430,14 +1672,12 @@ fn build_tokenized_struct_series(
     let row_count = columns.token_values.len();
     let mut fields = Vec::new();
 
-    if let Some(raw_values) = columns.raw_values {
-        fields.push(
-            StringChunked::from_iter_options(
-                "raw_value".into(),
-                raw_values.iter().map(|value| value.as_deref()),
-            )
-            .into_series(),
-        );
+    if layout.include_raw_value {
+        // `raw_value` mirrors the input column verbatim; reuse its Arrow buffers
+        // (Arc clone + rename) instead of rebuilding the column.
+        let mut raw = input.clone();
+        raw.rename("raw_value".into());
+        fields.push(raw);
     }
 
     fields.push(build_output_string_list_series(
@@ -1470,7 +1710,7 @@ fn build_tokenized_struct_series(
         fields.push(build_u8_list_series("class_ids", class_id_values));
     }
 
-    Ok(StructChunked::from_series(name, row_count, fields.iter())?.into_series())
+    Ok(StructChunked::from_series(input.name().clone(), row_count, fields.iter())?.into_series())
 }
 
 fn build_extract_struct_series(
@@ -1502,31 +1742,52 @@ fn build_extract_struct_series(
     Ok(StructChunked::from_series(name, row_count, field_series.iter())?.into_series())
 }
 
-fn init_extract_columns(
-    capture_names: &[String],
-    row_count: usize,
-) -> Vec<(String, Vec<Option<String>>)> {
-    capture_names
-        .iter()
-        .map(|name| (name.clone(), Vec::with_capacity(row_count)))
-        .collect()
+/// Streams serial-path extract results straight into Arrow string builders, one
+/// per capture field plus the complement. This avoids materializing the whole
+/// output column set as an intermediate `Vec<Option<String>>` (which doubled
+/// peak memory and added a copy): each captured value is *moved* out of the
+/// `ParseOutput` map and written once into the Arrow buffer.
+struct ExtractColumnBuilders {
+    fields: Vec<StringChunkedBuilder>,
+    complement: StringChunkedBuilder,
 }
 
-fn push_parse_output(
-    field_columns: &mut [(String, Vec<Option<String>>)],
-    complements: &mut Vec<Option<String>>,
-    output: Option<ParseOutput>,
-) {
-    if let Some(output) = output {
-        for (field_name, values) in field_columns.iter_mut() {
-            values.push(output.fields.get(field_name).cloned());
+impl ExtractColumnBuilders {
+    fn new(capture_names: &[String], row_count: usize) -> Self {
+        Self {
+            fields: capture_names
+                .iter()
+                .map(|name| StringChunkedBuilder::new(name.clone().into(), row_count))
+                .collect(),
+            complement: StringChunkedBuilder::new("complement".into(), row_count),
         }
-        complements.push(Some(output.complement));
-    } else {
-        for (_, values) in field_columns.iter_mut() {
-            values.push(None);
+    }
+
+    fn push(&mut self, capture_names: &[String], output: Option<ParseOutput>) {
+        if let Some(mut output) = output {
+            for (builder, name) in self.fields.iter_mut().zip(capture_names) {
+                match output.fields.remove(name) {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            self.complement.append_value(output.complement);
+        } else {
+            for builder in &mut self.fields {
+                builder.append_null();
+            }
+            self.complement.append_null();
         }
-        complements.push(None);
+    }
+
+    fn finish(self, name: PlSmallStr, row_count: usize) -> PolarsResult<Series> {
+        let mut field_series = self
+            .fields
+            .into_iter()
+            .map(|builder| builder.finish().into_series())
+            .collect::<Vec<_>>();
+        field_series.push(self.complement.finish().into_series());
+        Ok(StructChunked::from_series(name, row_count, field_series.iter())?.into_series())
     }
 }
 
@@ -1608,6 +1869,12 @@ fn build_u8_list_series(name: &str, rows: Vec<Option<Vec<u8>>>) -> Series {
     builder.finish().into_series()
 }
 
+/// ASCII whitespace per Unicode `White_Space` (matches `char::is_whitespace`
+/// for ASCII, which includes vertical tab `0x0B` unlike `u8::is_ascii_whitespace`).
+const fn ascii_is_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
 fn classify_token_ref<'a>(
     token: &'a str,
     model: &'a TokenModel,
@@ -1617,66 +1884,83 @@ fn classify_token_ref<'a>(
         return Cow::Borrowed(token);
     }
 
-    if token.is_ascii() && features.has_postalcode {
-        let compact: String = token
-            .chars()
-            .filter(|character| {
-                !character.is_whitespace() && *character != '-' && *character != '_'
-            })
-            .collect();
-        let chars: Vec<char> = compact.chars().collect();
-        if chars.len() == 6
-            && chars[0].is_ascii_alphabetic()
-            && chars[1].is_ascii_digit()
-            && chars[2].is_ascii_alphabetic()
-            && chars[3].is_ascii_digit()
-            && chars[4].is_ascii_alphabetic()
-            && chars[5].is_ascii_digit()
+    // Fast-path classification: every shortcut below requires an ASCII token, so
+    // compute all character-class predicates in a single byte pass instead of
+    // re-walking `token.chars()` (and re-checking `is_ascii`) up to ten times,
+    // and validate the POSTALCODE shape without allocating a `String`/`Vec`.
+    if token.is_ascii() {
+        let mut all_digit = true;
+        let mut all_alpha = true;
+        let mut has_digit = false;
+        let mut has_alpha = false;
+        let mut all_digit_or_dash = true;
+        let mut all_alpha_dash_apos = true;
+        let mut all_alnum = true;
+        let mut all_alnum_dash_apos = true;
+
+        // Compacted (whitespace/'-'/'_' stripped) characters for the A1A1A1
+        // POSTALCODE check; capped at 7 so we can cheaply reject anything > 6.
+        let mut postal = [0_u8; 6];
+        let mut postal_len = 0_usize;
+        let mut postal_overflow = false;
+
+        for &byte in token.as_bytes() {
+            let is_digit = byte.is_ascii_digit();
+            let is_alpha = byte.is_ascii_alphabetic();
+            let is_dash = byte == b'-';
+            let is_apos = byte == b'\'';
+            let is_alnum = is_digit | is_alpha;
+
+            has_digit |= is_digit;
+            has_alpha |= is_alpha;
+            all_digit &= is_digit;
+            all_alpha &= is_alpha;
+            all_digit_or_dash &= is_digit | is_dash;
+            all_alpha_dash_apos &= is_alpha | is_dash | is_apos;
+            all_alnum &= is_alnum;
+            all_alnum_dash_apos &= is_alnum | is_dash | is_apos;
+
+            if features.has_postalcode
+                && !postal_overflow
+                && !is_dash
+                && byte != b'_'
+                && !ascii_is_whitespace(byte)
+            {
+                if postal_len < postal.len() {
+                    postal[postal_len] = byte;
+                    postal_len += 1;
+                } else {
+                    postal_overflow = true;
+                }
+            }
+        }
+
+        if features.has_postalcode
+            && !postal_overflow
+            && postal_len == 6
+            && postal[0].is_ascii_alphabetic()
+            && postal[1].is_ascii_digit()
+            && postal[2].is_ascii_alphabetic()
+            && postal[3].is_ascii_digit()
+            && postal[4].is_ascii_alphabetic()
+            && postal[5].is_ascii_digit()
         {
             return Cow::Borrowed("POSTALCODE");
         }
-    }
-
-    if token.is_ascii()
-        && token.chars().all(|character| character.is_ascii_digit())
-        && features.has_num
-    {
-        return Cow::Borrowed("NUM");
-    }
-
-    if token.is_ascii() && token.chars().all(char::is_alphabetic) && features.has_alpha {
-        return Cow::Borrowed("ALPHA");
-    }
-
-    if token.is_ascii()
-        && token
-            .chars()
-            .all(|character| character.is_ascii_digit() || character == '-')
-        && token.chars().any(|character| character.is_ascii_digit())
-        && features.has_num_extended
-    {
-        return Cow::Borrowed("NUM_EXTENDED");
-    }
-
-    if token.is_ascii()
-        && token
-            .chars()
-            .all(|character| character.is_alphabetic() || character == '-' || character == '\'')
-        && token.chars().any(char::is_alphabetic)
-        && features.has_alpha_extended
-    {
-        return Cow::Borrowed("ALPHA_EXTENDED");
-    }
-
-    if token.is_ascii()
-        && token
-            .chars()
-            .all(|character| character.is_alphanumeric() || character == '-' || character == '\'')
-    {
-        let has_alpha = token.chars().any(char::is_alphabetic);
-        let has_digit = token.chars().any(|character| character.is_ascii_digit());
-        if has_alpha && has_digit {
-            if token.chars().all(char::is_alphanumeric) && features.has_alpha_num {
+        if all_digit && features.has_num {
+            return Cow::Borrowed("NUM");
+        }
+        if all_alpha && features.has_alpha {
+            return Cow::Borrowed("ALPHA");
+        }
+        if all_digit_or_dash && has_digit && features.has_num_extended {
+            return Cow::Borrowed("NUM_EXTENDED");
+        }
+        if all_alpha_dash_apos && has_alpha && features.has_alpha_extended {
+            return Cow::Borrowed("ALPHA_EXTENDED");
+        }
+        if all_alnum_dash_apos && has_alpha && has_digit {
+            if all_alnum && features.has_alpha_num {
                 return Cow::Borrowed("ALPHA_NUM");
             }
             if features.has_alpha_num_extended {
@@ -1698,7 +1982,7 @@ fn classify_token_ref<'a>(
 }
 
 fn tokenize_row(raw_value: &str, context: &ModelContext, layout: TokenizeLayout) -> TokenizedRow {
-    let tokens = split_input_tokens(raw_value);
+    let tokens = split_input_tokens_with(raw_value, context.model.word_boundary());
     let mut type_values = layout
         .needs_type_values()
         .then(|| Vec::with_capacity(tokens.len()));
@@ -1742,7 +2026,6 @@ fn tokenize_row(raw_value: &str, context: &ModelContext, layout: TokenizeLayout)
     }
 
     TokenizedRow {
-        raw_value: layout.include_raw_value.then(|| raw_value.to_string()),
         tokens,
         types: type_values,
         classes: class_values,
@@ -2076,6 +2359,127 @@ mod tests {
 
         assert_eq!(civic, Some("123"));
         assert_eq!(complement, Some("ATTN "));
+    }
+
+    #[test]
+    fn per_model_word_definition_changes_tokenization() {
+        let wd_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/model_worddef")
+            .to_string_lossy()
+            .into_owned();
+        // Load both models. The custom model's `WORDDEFINITION.param` adds `.`
+        // as a word char; the default does not. Because tokenization now uses the
+        // per-model boundary (not the process-global), results are deterministic
+        // regardless of which model was loaded last.
+        let default_plugin =
+            TokmatPolars::from_model_path(fixture_model_path()).expect("model_1 loads");
+        let wd_plugin = TokmatPolars::from_model_path(&wd_path).expect("model_worddef loads");
+
+        let input = Series::new("address".into(), ["192.168 MAIN"]);
+        let first_tokens = |plugin: &TokmatPolars| -> Vec<String> {
+            let out = plugin.tokenize_series(&input).expect("tokenize");
+            let st = out.struct_().expect("struct output");
+            let fields = st.fields_as_series();
+            let tokens = fields
+                .iter()
+                .find(|f| f.name().as_str() == "tokens")
+                .expect("tokens field");
+            let first = tokens
+                .list()
+                .expect("list")
+                .into_iter()
+                .next()
+                .flatten()
+                .expect("first row");
+            list_series_to_strings(&first).expect("token strings")
+        };
+
+        let wd_tokens = first_tokens(&wd_plugin);
+        let default_tokens = first_tokens(&default_plugin);
+
+        // Custom def: `.` is a word char, so "192.168" stays one token.
+        assert!(
+            wd_tokens.iter().any(|t| t == "192.168"),
+            "custom-word-def tokens: {wd_tokens:?}"
+        );
+        // Default def: `.` is a boundary, so "192.168" splits.
+        assert!(
+            !default_tokens.iter().any(|t| t == "192.168")
+                && default_tokens.iter().any(|t| t == "192"),
+            "default tokens: {default_tokens:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_tokenize_matches_serial_across_chunks() {
+        let context = get_or_load_context(&fixture_model_path()).expect("model should load");
+        let layout = TokenizeLayout {
+            include_raw_value: true,
+            include_types: true,
+            include_classes: true,
+            include_type_ids: true,
+            include_class_ids: true,
+            token_output: StringListOutput::String,
+            type_output: StringListOutput::String,
+            class_output: StringListOutput::String,
+        };
+        let input = Series::new(
+            "address".into(),
+            &[
+                Some("123 MAIN ST"),
+                None,
+                Some("4567 OAK AVE NW"),
+                Some("89 KING ST W"),
+                Some("K1A 0B1"),
+                None,
+                Some("12-34 RIVER RD"),
+                Some("O'CONNOR BLVD"),
+                Some("1 A ST"),
+                Some("PO BOX 42"),
+            ],
+        );
+
+        let serial = tokenize_series_serial(&input, &context, layout).expect("serial tokenize");
+        // chunk_size = 3 forces multiple chunks + the null-boundary cases.
+        let chunked =
+            tokenize_series_chunked(&input, &context, layout, 3).expect("chunked tokenize");
+
+        assert!(
+            serial.equals_missing(&chunked),
+            "parallel/chunked tokenize output must equal serial output"
+        );
+    }
+
+    #[test]
+    fn classify_token_ref_covers_fast_path_branches() {
+        let context = get_or_load_context(&fixture_model_path()).expect("model should load");
+        let classify =
+            |token: &str| classify_token_ref(token, &context.model, context.features).into_owned();
+
+        // POSTALCODE shape (A1A1A1), including dash/underscore/space stripping.
+        assert_eq!(classify("K1A0B1"), "POSTALCODE");
+        assert_eq!(classify("K1A-0B1"), "POSTALCODE");
+        assert_eq!(classify("K1A_0B1"), "POSTALCODE");
+        // Not a postal code: wrong length / shape.
+        assert_ne!(classify("K1A0B12"), "POSTALCODE");
+        assert_ne!(classify("KKA0B1"), "POSTALCODE");
+
+        // Pure digit / pure alpha.
+        assert_eq!(classify("123"), "NUM");
+        assert_eq!(classify("MAIN"), "ALPHA");
+
+        // Extended classes.
+        assert_eq!(classify("12-34"), "NUM_EXTENDED");
+        assert_eq!(classify("O'BRIEN"), "ALPHA_EXTENDED");
+        assert_eq!(classify("ST-PAUL"), "ALPHA_EXTENDED");
+
+        // Mixed alphanumerics.
+        assert_eq!(classify("12A"), "ALPHA_NUM");
+        assert_eq!(classify("12A-B"), "ALPHA_NUM_EXTENDED");
+
+        // Non-ASCII falls through to the regex path (never a fast-path class).
+        let allee = classify("ALLÉE");
+        assert!(allee != "ALPHA" && allee != "NUM");
     }
 
     #[test]

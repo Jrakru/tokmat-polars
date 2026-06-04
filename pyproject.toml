@@ -36,4 +36,7 @@ Documentation = "https://docs.rs/tokmat-polars"
 
 [tool.maturin]
 bindings = "pyo3"
-module-name = "tokmat_polars"
+# Mixed layout: pure-Python package in `python/tokmat_polars/` (the user-facing
+# API) plus the compiled extension as a private submodule `_tokmat_polars`.
+python-source = "python"
+module-name = "tokmat_polars._tokmat_polars"

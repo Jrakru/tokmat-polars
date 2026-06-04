@@ -15,6 +15,20 @@ categories = ["parser-implementations", "text-processing"]
 [package.metadata]
 copyright = "Copyright (c) 2026 Jean Philippe Wan"
 
+# Optimized release build for the compiled extension module / rlib.
+# `panic = "unwind"` (the default) is kept intentionally so a Rust panic
+# surfaces as a Python exception across the PyO3 boundary rather than
+# aborting the interpreter. The bench profile inherits these settings.
+#
+# `lto = "thin"` captures most of fat-LTO's cross-crate inlining (notably
+# inlining the tokmat extractor into the plugin loop) at a fraction of the
+# link time. For the published wheel, CI can override to fat LTO via
+# `CARGO_PROFILE_RELEASE_LTO=fat` where the longer build is acceptable.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [package.metadata.docs.rs]
 all-features = true
 
@@ -36,4 +50,11 @@ pyo3-polars = { version = "0.19", features = ["derive"] }
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 smallvec = "1.13"
-tokmat = "0.2.0"
+tokmat = "0.3.0"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "tokmat_bench"
+harness = false

@@ -1,29 +1,44 @@
 from pathlib import Path
 
 import polars as pl
-import tokmat_polars
+import tokmat_polars as tk
+from tokmat_polars import _tokmat_polars
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = REPO_ROOT / "tests" / "fixtures" / "model_1"
-PLUGIN_PATH = Path(tokmat_polars.__file__).resolve().parent
 PATTERN = "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>"
+
+_DISPATCH = {
+    "tokenize_expr": tk.tokenize,
+    "extract_expr": tk.extract,
+    "encode_class_ids_expr": tk.encode_class_ids,
+}
 
 
 def plugin_expr(function_name: str, arg: pl.Expr, **kwargs: object) -> pl.Expr:
-    return pl.plugins.register_plugin_function(
-        plugin_path=PLUGIN_PATH,
-        function_name=function_name,
-        args=arg,
-        kwargs=kwargs,
-        use_abs_path=True,
+    # Route through the public wrapper API, which registers the plugin with
+    # is_elementwise=True.
+    return _DISPATCH[function_name](arg, **kwargs)
+
+
+def test_wrapper_exposes_api_and_compiled_module() -> None:
+    assert {"tokenize", "extract", "encode_class_ids"} <= set(tk.__all__)
+    so_path = Path(_tokmat_polars.__file__)
+    assert so_path.suffix in {".so", ".pyd", ".dll"}
+
+
+def test_tokenize_is_registered_elementwise() -> None:
+    # An elementwise plugin participates in streaming and lets Polars resolve the
+    # output schema at plan time without executing. Both should hold here.
+    lf = pl.LazyFrame({"address": ["123 MAIN ST"]}).select(
+        tk.tokenize(pl.col("address"), model_path=str(MODEL_PATH)).alias("tok")
     )
-
-
-def test_imported_extension_exposes_binary_module() -> None:
-    assert tokmat_polars.__file__
-    assert PLUGIN_PATH.is_dir()
-    assert any(path.suffix in {".so", ".pyd", ".dll"} for path in PLUGIN_PATH.iterdir())
+    schema = lf.collect_schema()  # plan-time schema, no execution
+    assert isinstance(schema["tok"], pl.Struct)
+    # Streaming engine can run the elementwise plugin end to end.
+    out = lf.unnest("tok").collect(engine="streaming")
+    assert out["tokens"].to_list()[0] == ["123", " ", "MAIN", " ", "ST"]
 
 
 def test_tokenize_plugin_runs_inside_polars() -> None:
