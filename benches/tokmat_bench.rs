@@ -19,13 +19,6 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use polars::prelude::*;
 use tokmat_polars::TokmatPolars;
 
-// Experiment: process-wide allocator. The default system allocator (glibc
-// malloc) contends badly under many threads doing high-frequency small
-// allocations (PCRE2 match data, plan builds). mimalloc has per-thread heaps and
-// is the control for the "parallel extract is allocator-bound" hypothesis.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 const ROW_COUNT: usize = 1_000_000;
 const PATTERN: &str = "<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>";
 
@@ -115,15 +108,6 @@ fn bench(c: &mut Criterion) {
         .tokenize_series(&input)
         .expect("tokenize for extract setup");
 
-    // Low-cardinality corpus: every row identical. The object-plan cache hits
-    // after the first row, so there is no per-row plan rebuild -- isolates the
-    // per-row *match* path from the per-row *build* path for the parallel
-    // contention investigation.
-    let lowcard_input = Series::new("address".into(), vec!["123 MAIN ST".to_string(); ROW_COUNT]);
-    let lowcard_tokenized = plugin
-        .tokenize_series(&lowcard_input)
-        .expect("tokenize lowcard setup");
-
     let mut group = c.benchmark_group("tokmat_1mm");
     group.throughput(Throughput::Elements(ROW_COUNT as u64));
     group.sample_size(10);
@@ -158,14 +142,6 @@ fn bench(c: &mut Criterion) {
                     .extract_series(tokenized, PATTERN)
                     .expect("extract tokenized")
             },
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.bench_function("extract_from_tokenized_lowcard", |b| {
-        b.iter_batched(
-            || &lowcard_tokenized,
-            |t| plugin.extract_series(t, PATTERN).expect("extract lowcard"),
             BatchSize::LargeInput,
         );
     });
