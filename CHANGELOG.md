@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.1] - 2026-06-10
+
+### Changed
+
+- Depends on the published `tokmat = "0.3.1"` patch release, which keeps TEL
+  vanishing groups class-strict for downstream Polars and Python callers.
+
 ## [0.3.0] - 2026-06-04
 
 ### Added
