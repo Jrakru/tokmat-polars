@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.2] - 2026-06-12
+
+### Fixed
+
+- Extraction no longer writes the process-global word definition
+  (`configure_word_definition`) per call. With models of differing word
+  definitions extracting concurrently — e.g. the Polars streaming engine
+  invoking the elementwise extract expression per morsel across passes — that
+  write raced, producing nondeterministic results and intermittent
+  `PCRE2 match limit exceeded` errors. The model's word definition is now
+  threaded into compilation (`CompiledPattern::compile_with_word_definition`)
+  and onto the per-model `Extractor` (`Extractor::with_word_definition`), so
+  extraction is deterministic regardless of inter-model interleaving. Removing
+  the per-call global `RwLock` write also reduces lock contention under
+  multi-threaded execution.
+
+### Changed
+
+- Depends on the published `tokmat = "0.3.2"` patch release.
+
 ## [0.3.1] - 2026-06-10
 
 ### Changed

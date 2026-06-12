@@ -785,15 +785,14 @@ fn extract_series_with_context(
     pattern: &str,
     mode: MatchMode,
 ) -> PolarsResult<Series> {
-    // The TEL compiler and object-plan builder still read the process-global word
-    // definition. Re-apply this model's definition for the duration of the call so
-    // extraction honors the model's `WORDDEFINITION.param` rather than whatever was
-    // configured last. (Tokenization is already per-model via `word_boundary`.)
-    // Residual: truly concurrent extraction of *different* models in one process
-    // can still race the global — full isolation needs the word definition threaded
-    // through `CompiledPattern::compile` / the `Extractor`. See the perf report.
-    configure_word_definition(context.word_definition.clone());
-
+    // The model's word definition is threaded explicitly through
+    // `CompiledPattern::compile_with_word_definition` (see `compile_extract_pattern`)
+    // and into the object-plan builder via the per-model `Extractor`, so extraction
+    // honors this model's `WORDDEFINITION.param` without touching process-global
+    // state. This is what makes concurrent extraction of *different* models (e.g.
+    // the polars streaming engine invoking elementwise plugin expressions per morsel
+    // across passes) deterministic — the previous `configure_word_definition` write
+    // raced when models had differing word definitions.
     let capture_names = capture_field_names_from_pattern(pattern)?;
 
     match input.dtype() {
@@ -833,7 +832,8 @@ fn get_or_load_context(model_path: &str) -> PolarsResult<Arc<ModelContext>> {
     let extractor = Extractor::new(
         model.token_definitions().clone(),
         model.token_class_list().clone(),
-    );
+    )
+    .with_word_definition(model.word_definition().clone());
 
     let type_vocab = model
         .token_definitions()
@@ -1037,7 +1037,7 @@ fn extract_from_string_series(
     capture_names: &[String],
 ) -> PolarsResult<Series> {
     let row_count = input.len();
-    let compiled_pattern = compile_extract_pattern(pattern)?;
+    let compiled_pattern = compile_extract_pattern(pattern, &context.word_definition)?;
     let extractor = &context.extractor;
     let mut builders = ExtractColumnBuilders::new(capture_names, row_count);
 
@@ -1145,7 +1145,7 @@ fn extract_from_tokenized_series(
         .map(|field| field.list().map(IntoIterator::into_iter))
         .transpose()?;
     let row_count = input.len();
-    let compiled_pattern = compile_extract_pattern(pattern)?;
+    let compiled_pattern = compile_extract_pattern(pattern, &context.word_definition)?;
     let extractor = &context.extractor;
     let mut builders = ExtractColumnBuilders::new(capture_names, row_count);
     let profiling = profile_enabled();
@@ -1372,7 +1372,7 @@ fn process_extract_chunk(
     let mut complements = Vec::with_capacity(end - start);
     let mut compact_profile = CompactExtractProfile::default();
     let mut class_id_values = Vec::new();
-    let compiled_pattern = compile_extract_pattern(pattern)?;
+    let compiled_pattern = compile_extract_pattern(pattern, &context.word_definition)?;
     // Per-chunk extractor: its own caches, so rayon workers never contend on the
     // shared extractor's Mutex-guarded plan/regex caches (the root cause of the
     // parallel-extract regression). See `fresh_chunk_extractor`.
@@ -1519,11 +1519,20 @@ fn fresh_chunk_extractor(context: &ModelContext) -> Extractor {
         context.model.token_definitions().clone(),
         context.model.token_class_list().clone(),
     )
+    .with_word_definition(context.word_definition.clone())
 }
 
 /// Compile the TEL pattern once per extract call (hoisted out of the row loop).
-fn compile_extract_pattern(pattern: &str) -> PolarsResult<CompiledPattern> {
-    CompiledPattern::compile(pattern).map_err(
+///
+/// The model's word definition is baked into the compiled pattern (and carried
+/// on it) so neither compilation nor the downstream object-plan builder reads
+/// process-global state. This is what keeps concurrent extraction of different
+/// models deterministic.
+fn compile_extract_pattern(
+    pattern: &str,
+    word_definition: &WordDefinition,
+) -> PolarsResult<CompiledPattern> {
+    CompiledPattern::compile_with_word_definition(pattern, word_definition).map_err(
         |error| polars_err!(ComputeError: "failed to compile TEL pattern '{}': {}", pattern, error),
     )
 }
@@ -2407,6 +2416,102 @@ mod tests {
             !default_tokens.iter().any(|t| t == "192.168")
                 && default_tokens.iter().any(|t| t == "192"),
             "default tokens: {default_tokens:?}"
+        );
+    }
+
+    fn worddef_model_path() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/model_worddef")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // Regression guard for the process-global word-definition race
+    // (`wanparser-streaming-engine-nondeterminism`): extraction must compile
+    // with each model's own word definition, threaded onto the compiled pattern
+    // and the extractor, never via process-global state. A revert that drops
+    // `with_word_definition` or routes compilation back through the global-reading
+    // `CompiledPattern::compile` fails these assertions.
+    #[test]
+    fn extraction_wires_per_model_word_definition_onto_context_and_pattern() {
+        let default_ctx = get_or_load_context(&fixture_model_path()).expect("model_1 loads");
+        let wd_ctx = get_or_load_context(&worddef_model_path()).expect("model_worddef loads");
+
+        // The context's model definition and the per-model extractor agree.
+        assert_eq!(default_ctx.word_definition.chars(), r"\w\-'");
+        assert_eq!(default_ctx.extractor.word_definition().chars(), r"\w\-'");
+        assert_eq!(wd_ctx.word_definition.chars(), r"\w\-'.");
+        assert_eq!(wd_ctx.extractor.word_definition().chars(), r"\w\-'.");
+
+        // Compiling an extract pattern bakes the model's definition onto the
+        // pattern (so the downstream object-plan builder reuses the exact same
+        // word-boundary class).
+        let pattern = "<<NAME>>";
+        let default_compiled =
+            compile_extract_pattern(pattern, &default_ctx.word_definition).expect("compiles");
+        let wd_compiled =
+            compile_extract_pattern(pattern, &wd_ctx.word_definition).expect("compiles");
+
+        assert_eq!(default_compiled.word_definition().chars(), r"\w\-'");
+        assert_eq!(wd_compiled.word_definition().chars(), r"\w\-'.");
+        assert!(
+            wd_compiled
+                .class_pattern(tokmat::tel::MatchMode::Whole)
+                .contains(r"\w\-'."),
+            "model word definition must be baked into the class comparator: {}",
+            wd_compiled.class_pattern(tokmat::tel::MatchMode::Whole)
+        );
+        assert!(
+            !default_compiled
+                .class_pattern(tokmat::tel::MatchMode::Whole)
+                .contains(r"\w\-'."),
+        );
+    }
+
+    // End-to-end guard for the write-race: extracting with one model must not
+    // perturb extraction with another model, regardless of order. Before the fix
+    // each extract wrote the model's definition to a process-global, so
+    // interleaving models with different definitions produced order-dependent
+    // results.
+    #[test]
+    fn extraction_is_order_independent_across_models() {
+        let default_plugin =
+            TokmatPolars::from_model_path(fixture_model_path()).expect("model_1 loads");
+        let wd_plugin =
+            TokmatPolars::from_model_path(worddef_model_path()).expect("model_worddef loads");
+
+        let input = Series::new("address".into(), ["192.168 MAIN"]);
+        let pattern = "<<FIRST%>>";
+        let extract = |plugin: &TokmatPolars| -> Series {
+            plugin
+                .extract_series_with_mode(&input, pattern, MatchMode::Start)
+                .expect("extract")
+        };
+
+        // Baselines, each model alone.
+        let wd_alone = extract(&wd_plugin);
+        let default_alone = extract(&default_plugin);
+
+        // Interleave: a default extraction between two word-def extractions must
+        // not change the word-def result.
+        let _ = extract(&default_plugin);
+        let wd_after_default = extract(&wd_plugin);
+        let _ = extract(&wd_plugin);
+        let default_after_wd = extract(&default_plugin);
+
+        assert!(
+            wd_alone.equals(&wd_after_default),
+            "word-def extraction must be independent of interleaved other-model extraction",
+        );
+        assert!(
+            default_alone.equals(&default_after_wd),
+            "default extraction must be independent of interleaved other-model extraction",
+        );
+        // The two models genuinely consult different word definitions, so the
+        // order-independence above is a meaningful property, not a vacuous one.
+        assert!(
+            !wd_alone.equals(&default_alone),
+            "models with different word definitions must extract differently",
         );
     }
 
