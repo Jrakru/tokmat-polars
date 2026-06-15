@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.4] - 2026-06-15
+
+### Fixed
+
+- Constrained pytest discovery to the source `tests/` directory and excluded
+  generated build/package directories, preventing plain `pytest` from collecting
+  the `target/package` copy left by `cargo publish --dry-run`.
+
 ## [0.3.3] - 2026-06-15
 
 ### Changed
