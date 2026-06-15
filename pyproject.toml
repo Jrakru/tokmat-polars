@@ -40,3 +40,7 @@ bindings = "pyo3"
 # API) plus the compiled extension as a private submodule `_tokmat_polars`.
 python-source = "python"
 module-name = "tokmat_polars._tokmat_polars"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["target", ".venv", "dist"]
