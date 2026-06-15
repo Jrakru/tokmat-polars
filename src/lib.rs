@@ -2068,6 +2068,29 @@ mod tests {
         }
     }
 
+    fn string_field_at(series: &Series, name: &str, row: usize) -> Option<String> {
+        let struct_chunked = series.struct_().expect("output should be a struct");
+        let fields = struct_chunked.fields_as_series();
+        fields
+            .iter()
+            .find(|field| field.name().as_str() == name)
+            .unwrap_or_else(|| panic!("{name} field should exist"))
+            .str()
+            .unwrap_or_else(|_| panic!("{name} field should be string"))
+            .get(row)
+            .map(ToString::to_string)
+    }
+
+    fn struct_field_names(series: &Series) -> Vec<String> {
+        series
+            .struct_()
+            .expect("output should be a struct")
+            .fields_as_series()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect()
+    }
+
     #[test]
     fn tokenize_helper_returns_struct_with_expected_fields() {
         let input = Series::new("address".into(), &[Some("123 MAIN ST"), None]);
@@ -2371,6 +2394,107 @@ mod tests {
     }
 
     #[test]
+    fn extract_helper_drops_capture_like_vanishing_groups() {
+        let input = Series::new("address".into(), ["ATTN 123 MAIN ST"]);
+        let output = extract_expr_impl(
+            &[input],
+            ExtractKwargs {
+                model_path: fixture_model_path(),
+                pattern: "<!DROP@!> <<CIVIC::NUM>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: MatchModeKwarg::Whole,
+            },
+        )
+        .expect("capture-like vanishing extract should succeed");
+
+        assert_eq!(string_field_at(&output, "CIVIC", 0).as_deref(), Some("123"));
+        assert_eq!(
+            string_field_at(&output, "STREET", 0).as_deref(),
+            Some("MAIN")
+        );
+        assert_eq!(string_field_at(&output, "TYPE", 0).as_deref(), Some("ST"));
+        assert_eq!(
+            string_field_at(&output, "complement", 0).as_deref(),
+            Some("ATTN ")
+        );
+        assert!(
+            !struct_field_names(&output)
+                .iter()
+                .any(|name| name == "DROP"),
+            "vanishing group labels must not become output fields"
+        );
+    }
+
+    #[test]
+    fn extract_helper_applies_optional_literal_vanishing_to_tokenized_structs() {
+        let tokenized = tokenize_expr_impl(
+            &[Series::new(
+                "address".into(),
+                ["#123 MAIN ST", "123 MAIN ST"],
+            )],
+            &legacy_tokenize_kwargs(),
+        )
+        .expect("tokenize should succeed");
+
+        let output = extract_expr_impl(
+            &[tokenized],
+            ExtractKwargs {
+                model_path: fixture_model_path(),
+                pattern: "<!{{#}}?!> <<CIVIC::NUM>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: MatchModeKwarg::Whole,
+            },
+        )
+        .expect("optional literal vanishing extract should succeed");
+
+        assert_eq!(string_field_at(&output, "CIVIC", 0).as_deref(), Some("123"));
+        assert_eq!(
+            string_field_at(&output, "STREET", 0).as_deref(),
+            Some("MAIN")
+        );
+        assert_eq!(string_field_at(&output, "TYPE", 0).as_deref(), Some("ST"));
+        assert_eq!(
+            string_field_at(&output, "complement", 0).as_deref(),
+            Some("#")
+        );
+        assert_eq!(string_field_at(&output, "CIVIC", 1).as_deref(), Some("123"));
+        assert_eq!(
+            string_field_at(&output, "STREET", 1).as_deref(),
+            Some("MAIN")
+        );
+        assert_eq!(string_field_at(&output, "TYPE", 1).as_deref(), Some("ST"));
+        assert_eq!(
+            string_field_at(&output, "complement", 1).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn extract_helper_applies_anonymous_optional_vanishing_groups() {
+        let input = Series::new("address".into(), ["ATTN 123 MAIN ST", "123 MAIN ST"]);
+        let output = extract_expr_impl(
+            &[input],
+            ExtractKwargs {
+                model_path: fixture_model_path(),
+                pattern: "<!?!> <<CIVIC::NUM>> <<STREET@+>> <<TYPE::STREETTYPE>>".to_string(),
+                mode: MatchModeKwarg::Whole,
+            },
+        )
+        .expect("anonymous optional vanishing extract should succeed");
+
+        assert_eq!(string_field_at(&output, "CIVIC", 0).as_deref(), Some("123"));
+        assert_eq!(
+            string_field_at(&output, "STREET", 0).as_deref(),
+            Some("MAIN")
+        );
+        assert_eq!(string_field_at(&output, "TYPE", 0).as_deref(), Some("ST"));
+        assert_eq!(string_field_at(&output, "CIVIC", 1).as_deref(), Some("123"));
+        assert_eq!(
+            string_field_at(&output, "STREET", 1).as_deref(),
+            Some("MAIN")
+        );
+        assert_eq!(string_field_at(&output, "TYPE", 1).as_deref(), Some("ST"));
+    }
+
+    #[test]
     fn per_model_word_definition_changes_tokenization() {
         let wd_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/model_worddef")
@@ -2615,7 +2739,7 @@ mod tests {
         assert_eq!(civic, Some("123"));
         assert_eq!(
             plugin
-                .capture_field_names("<<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>")
+                .capture_field_names("<!DROP@!> <<CIVIC#>> <<STREET@+>> <<TYPE::STREETTYPE>>")
                 .expect("capture names"),
             vec![
                 "CIVIC".to_string(),

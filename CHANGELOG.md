@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.3] - 2026-06-15
+
+### Changed
+
+- Depends on the published `tokmat = "0.3.3"` patch release, bringing TEL
+  support for optional literal vanishing groups, capture-style vanishing groups,
+  and anonymous optional vanishing groups into Polars and Python plugin callers.
+
+### Fixed
+
+- Added Polars-side regression coverage showing that vanishing TEL groups match
+  without becoming output fields and that optional literal/anonymous vanishing
+  groups work for both raw-string and pre-tokenized struct inputs.
+
 ## [0.3.2] - 2026-06-12
 
 ### Fixed
